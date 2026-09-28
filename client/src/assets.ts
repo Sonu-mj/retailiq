@@ -1,0 +1,14 @@
+import brownie from "./assets/brownie.jpg";
+import cafeLatte from "./assets/cafe-latte.jpg";
+import cappuccino from "./assets/cappuccino.jpg";
+import chickenBurger from "./assets/chicken-burger.jpg";
+import chickenSandwich from "./assets/chicken-sandwich.jpg";
+import chocolateDonut from "./assets/chocolate-donut.jpg";
+import coke from "./assets/coke.jpg";
+import coldCoffee from "./assets/cold-coffee.jpg";
+import frenchFries from "./assets/french-fries.jpg";
+import orangeJuice from "./assets/orange-juice.jpg";
+import pizza from "./assets/pizza.jpg";
+import vegBurger from "./assets/veg-burger.jpg";
+import vegSandwich from "./assets/veg-sandwich.jpg";
+export const productImages: Record<string,string> = {"brownie":brownie,"cafe-latte":cafeLatte,"cappuccino":cappuccino,"chicken-burger":chickenBurger,"chicken-sandwich":chickenSandwich,"chocolate-donut":chocolateDonut,"coke":coke,"cold-coffee":coldCoffee,"french-fries":frenchFries,"orange-juice":orangeJuice,"pizza":pizza,"veg-burger":vegBurger,"veg-sandwich":vegSandwich};

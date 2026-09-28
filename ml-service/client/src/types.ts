@@ -1,0 +1,10 @@
+export type PaymentMethod = "cash" | "upi" | "card";
+export type BillStatus = "completed" | "cancelled" | "held";
+export type ReturnStatus = "completed" | "partially_returned" | "fully_returned" | "cancelled" | "held";
+export type Role = "cashier" | "manager" | "owner";
+export type Product = { id:string; name:string; category_id:string; category_name:string; selling_price:number; cost_price:number; image_url:string|null; image_display_url:string|null; sku:string; is_active:boolean };
+export type Outlet = { id:string; name:string; code:string; city:string; address:string; phone:string; is_active:boolean };
+export type Customer = { id:string; name:string; phone:string|null; email:string|null };
+export type CartItem = { product: Product; quantity:number };
+export type BillItem = { id:string; product_id:string; product_name_snapshot:string; category_name_snapshot:string; quantity:number; returned_quantity:number; selling_price:number; cost_price:number; line_total:number };
+export type Bill = { id:string; bill_number:string; outlet_id:string; outlet_name:string; outlet_address:string; customer_id:string|null; customer_name:string; bill_timestamp:string; subtotal:number; discount:number; tax:number; total:number; original_total:number; returned_amount:number; net_amount:number; return_status:ReturnStatus; payment_method:PaymentMethod; status:BillStatus; items:BillItem[] };

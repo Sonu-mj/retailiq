@@ -1,0 +1,38 @@
+{
+  "name": "retailiq-pos",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vite --config vite.config.ts",
+    "build": "vite build --config vite.config.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.vercel.json",
+    "preview": "vite preview --config vite.config.ts"
+  },
+  "dependencies": {
+    "@hatch/space-sdk": "file:vendor/space-sdk",
+    "@tanstack/react-query": "5.100.10",
+    "drizzle-orm": "0.45.2",
+    "sql.js": "^1.13.0",
+    "lucide-react": "^0.468.0",
+    "react": "19.2.5",
+    "react-dom": "19.2.5",
+    "recharts": "2.15.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.13",
+    "@types/node": "^22.15.0",
+    "@types/sql.js": "^1.4.9",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vercel/node": "^5.5.0",
+    "tailwindcss": "4.1.13",
+    "tailwindcss-safe-area": "1.3.0",
+    "typescript": "5.6.3",
+    "vite": "^7.1.7"
+  }
+}

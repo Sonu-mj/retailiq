@@ -1,0 +1,83 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1790330609273,
+      "tag": "0001_initial",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1790330609273,
+      "tag": "0002_retailiq_transaction_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790331273256,
+      "tag": "0003_phase_3_operations_profitability",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1790331742371,
+      "tag": "0004_phase_4_anomaly_intelligence",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1790332389076,
+      "tag": "0005_phase_5_demand_forecasting_workforce",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1790333171752,
+      "tag": "0006_phase_6_business_insights",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1790546633940,
+      "tag": "0007_phase_7_access_control_audit",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1790547609589,
+      "tag": "0008_phase_8_inventory_stock_intelligence",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1790547962804,
+      "tag": "0009_products_offers_discounts",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1790601780922,
+      "tag": "0010_admin_employees_staff_scheduling",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1790615021012,
+      "tag": "0011_remove_demo_operational_records",
+      "breakpoints": true
+    }
+  ]
+}

@@ -6,8 +6,25 @@ import type { Database as SqlJsDatabase, SqlJsStatic } from "sql.js";
 import { definePrivilegedContracts, definePrivilegedHandlers, z } from "@hatch/space-sdk";
 
 const require = createRequire(import.meta.url);
-const initSqlJs = require("sql.js/dist/sql-asm.js") as () => Promise<SqlJsStatic>;
-const sqlJsRuntime = initSqlJs();
+let sqlJsRuntime: Promise<SqlJsStatic> | null = null;
+
+// Load sql.js only when a local SQLite adapter is actually needed. Keeping the
+// package load and initialization out of module scope prevents an unavailable
+// optional runtime from taking down every Vercel action during import.
+function getSqlJsRuntime(): Promise<SqlJsStatic> {
+  if (sqlJsRuntime) return sqlJsRuntime;
+  try {
+    const initSqlJs = require("sql.js/dist/sql-asm.js") as () => Promise<SqlJsStatic>;
+    sqlJsRuntime = Promise.resolve(initSqlJs()).catch(error => {
+      sqlJsRuntime = null;
+      throw new Error("The local SQLite runtime is unavailable on this server.", { cause: error });
+    });
+    return sqlJsRuntime;
+  } catch (error) {
+    sqlJsRuntime = null;
+    return Promise.reject(new Error("The local SQLite runtime is unavailable on this server.", { cause: error }));
+  }
+}
 
 // Small adapter preserving the query API used by the original Bun-hosted
 // implementation while running in a standard Vercel Node.js function. The
@@ -481,7 +498,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       }
       return rows;
     };
-    const SQL=await sqlJsRuntime;
+    const SQL=await getSqlJsRuntime();
     const managed=new Database(new SQL.Database(readFileSync(dbPath)));
     const reports:MigrationTableReport[]=[];
     try{
@@ -573,7 +590,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       return rows;
     };
     const makeDb=async(defs:Array<{name:string;columns:Array<{name:string;kind:"number"|"boolean"|"date"|"string"}>}>)=>{
-      const SQL=await sqlJsRuntime;
+      const SQL=await getSqlJsRuntime();
       const db=new Database(new SQL.Database());
       for(const def of defs){
         const name=assertName(def.name);const cols=def.columns.map(column=>`"${assertName(column.name)}" ${column.kind==="number"||column.kind==="boolean"?"REAL":"TEXT"}`).join(",");

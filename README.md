@@ -7,7 +7,8 @@ The deployed web app uses Supabase for authentication, data, Row Level Security,
 ## What is included
 
 - `client/` — React + TypeScript application and owned product images
-- `api/actions.ts` — same-origin Vercel Function used by the browser
+- `server/vercel-entry.ts` — source for the same-origin Vercel Function used by the browser
+- `scripts/vercel-build.mjs` — builds the client and bundles the complete server handler into `api/actions.js`
 - `server/` — typed RetailIQ actions, authorization, reporting, billing, inventory, staffing, and Supabase data adapter
 - `supabase/` — go-live, Auth/RLS, and private product-image bucket SQL
 - `drizzle/` — the original forward migration history for reference
@@ -57,7 +58,7 @@ The included `.gitignore` prevents dependencies, build output, logs, local datab
 1. Sign in to Vercel and choose **Add New → Project**.
 2. Import the GitHub repository.
 3. Leave **Root Directory** as the repository root.
-4. Vercel reads `vercel.json`; the build command is `npm run build` and the output directory is `dist`.
+4. Vercel reads `vercel.json`; the build command is `npm run vercel-build` and the output directory is `dist`. This also emits the bundled `api/actions.js` function.
 5. In **Environment Variables**, add `SUPABASE_URL` and `SUPABASE_ANON_KEY` for Production, Preview, and Development as appropriate.
 6. Add `SUPABASE_SERVICE_ROLE_KEY` only if one-click employee provisioning is required.
 7. Add any optional RetailIQ service URLs/tokens you use.
@@ -122,7 +123,7 @@ Before pushing changes:
 
 ```bash
 npm run typecheck
-npm run build
+npm run vercel-build
 ```
 
 ## Important runtime notes

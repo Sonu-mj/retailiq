@@ -10,8 +10,7 @@ import { privileged } from "@space/privileged";
 const dialect = new SQLiteSyncDialect();
 type AnyTable = Record<string, any>;
 type Selection = Record<string, any> | undefined;
-type ColumnDef = { property: string; name: string; kind: "number" | "boolean" | "date" | "string" | "timestamp_ms" };
-
+type ColumnDef = { property: string; name: string; kind: "number" | "boolean" | "date" | "string" };
 type TableDef = { name: string; columns: ColumnDef[] };
 type RemoteOperation = {
   kind: "select" | "insert" | "update" | "delete";
@@ -33,8 +32,7 @@ function tableDef(table: AnyTable): TableDef {
     columns: Object.entries(columns).map(([property, column]) => ({
       property,
       name: column.name as string,
-      kind: column.columnType === "SQLiteBoolean" ? "boolean" : column.columnType === "SQLiteTimestamp" ? "date" : (column as any).mode === "timestamp_ms" ? "timestamp_ms" : column.dataType === "number" ? "number" : "string",
-
+      kind: column.columnType === "SQLiteBoolean" ? "boolean" : (column.columnType === "SQLiteTimestamp" || (column as any).mode === "timestamp_ms") ? "date" : column.dataType === "number" ? "number" : "string",
     })),
   };
 }

@@ -10,7 +10,8 @@ import { privileged } from "@space/privileged";
 const dialect = new SQLiteSyncDialect();
 type AnyTable = Record<string, any>;
 type Selection = Record<string, any> | undefined;
-type ColumnDef = { property: string; name: string; kind: "number" | "boolean" | "date" | "string" };
+type ColumnDef = { property: string; name: string; kind: "number" | "boolean" | "date" | "string" | "timestamp_ms" };
+
 type TableDef = { name: string; columns: ColumnDef[] };
 type RemoteOperation = {
   kind: "select" | "insert" | "update" | "delete";

@@ -33,7 +33,7 @@ function tableDef(table: AnyTable): TableDef {
     columns: Object.entries(columns).map(([property, column]) => ({
       property,
       name: column.name as string,
-      kind: column.columnType === "SQLiteBoolean" ? "boolean" : (column.columnType === "SQLiteTimestamp" || (column as any).mode === "timestamp_ms") ? "date" : column.dataType === "number" ? "number" : "string",
+      kind: column.columnType === "SQLiteBoolean" ? "boolean" : column.columnType === "SQLiteTimestamp" ? "date" : (column as any).mode === "timestamp_ms" ? "timestamp_ms" : column.dataType === "number" ? "number" : "string",
 
     })),
   };

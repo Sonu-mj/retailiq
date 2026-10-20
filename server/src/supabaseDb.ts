@@ -32,13 +32,13 @@ function tableDef(table: AnyTable): TableDef {
     columns: Object.entries(columns).map(([property, column]) => ({
       property,
       name: column.name as string,
-      kind: column.columnType === "SQLiteBoolean" ? "boolean" : (column.columnType === "SQLiteTimestamp" || (column as any).mode === "timestamp_ms") ? "date" : column.dataType === "number" ? "number" : "string",
+      kind: column.columnType === "SQLiteBoolean" ? "boolean" : column.columnType === "SQLiteTimestamp" ? "date" : column.dataType === "number" ? "number" : "string",
     })),
   };
 }
 function normalize(value: unknown): string | number | boolean | null {
   if (value == null) return null;
-  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Date) return value.getTime();
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
   return JSON.stringify(value);
 }
@@ -84,7 +84,7 @@ function hydrate(rows: Array<Record<string, unknown>>, aliases: ReturnType<typeo
     const output: Record<string, any> = {};
     for (const item of aliases) {
       let value = row[item.alias];
-      if (item.kind === "date" && typeof value === "string") value = new Date(value);
+      if (item.kind === "date" && (typeof value === "string" || typeof value === "number")) value = new Date(value);
       if (item.kind === "boolean") value = value === true || value === 1;
       if (item.path.length === 1) output[item.path[0] ?? item.alias] = value;
       else {

@@ -18693,7 +18693,7 @@ var Actions = {
     const staleRun = (date5) => !date5 || Date.now() - date5.getTime() > 24 * 36e5;
     const mlStale = latestIntel?.status === "completed" && staleRun(latestIntel.completedAt ?? latestIntel.startedAt);
     const forecastStale = latestForecast?.status === "completed" && staleRun(latestForecast.generatedAt ?? latestForecast.trainedAt);
-    const services = [{ name: "Database", status: database, detail: database === "operational" ? "Read probe succeeded" : "Read probe failed" }, { name: "Authentication", status: "operational", detail: "Supabase access token and active profile verified" }, { name: "Analytics service", status: "operational", detail: "Profitability engine is available" }, { name: "ML service", status: latestIntel?.status === "completed" && !mlStale ? "operational" : latestIntel ? "degraded" : "unconfigured", detail: latestIntel?.status === "completed" && mlStale ? "The last completed scan is over 24 hours old, so current signals may be stale" : latestIntel ? latestIntel.status === "insufficient_data" ? "Waiting for enough sales history before signals can be produced" : latestIntel.notes ?? "The latest intelligence run did not complete" : "No intelligence run has been attempted" }, { name: "Forecast service", status: latestForecast?.status === "completed" && !forecastStale ? "operational" : latestForecast ? "degraded" : "unconfigured", detail: latestForecast?.status === "completed" && forecastStale ? "The last completed forecast is over 24 hours old, so predictions may be stale" : latestForecast ? latestForecast.status === "insufficient_data" ? "Waiting for enough sales history before forecasts can be produced" : latestForecast.notes ?? "The latest forecast run did not complete" : "No forecast run has been attempted" }];
+    const services = [{ name: "Database", status: database, detail: database === "operational" ? "Read probe succeeded" : "Read probe failed" }, { name: "Authentication", status: "operational", detail: "Supabase access token and active profile verified" }, { name: "Analytics service", status: "operational", detail: "Profitability engine is available" }, { name: "ML service", status: latestIntel?.status === "completed" && !mlStale ? "operational" : latestIntel ? "degraded" : "unconfigured", detail: !latestIntel ? "No intelligence run has been attempted" : latestIntel.status === "completed" ? mlStale ? `The last completed scan finished at ${(latestIntel.completedAt ?? latestIntel.startedAt).toISOString()}, over 24 hours ago, so current signals may be stale` : `Last scan completed at ${(latestIntel.completedAt ?? latestIntel.startedAt).toISOString()} with ${latestIntel.signalCount} signal${latestIntel.signalCount === 1 ? "" : "s"} across ${latestIntel.outletCount} outlet${latestIntel.outletCount === 1 ? "" : "s"}` : latestIntel.status === "insufficient_data" ? "Waiting for enough sales history before signals can be produced" : `The last intelligence scan failed at ${latestIntel.startedAt.toISOString()}. Open Anomalies and run a new scan to retry.` }, { name: "Forecast service", status: latestForecast?.status === "completed" && !forecastStale ? "operational" : latestForecast ? "degraded" : "unconfigured", detail: !latestForecast ? "No forecast run has been attempted" : latestForecast.status === "completed" ? forecastStale ? `The last completed forecast was generated at ${(latestForecast.generatedAt ?? latestForecast.trainedAt).toISOString()}, over 24 hours ago, so predictions may be stale` : `Last forecast generated at ${(latestForecast.generatedAt ?? latestForecast.trainedAt).toISOString()} from ${latestForecast.trainingRecords} training records across ${latestForecast.outletCount} outlet${latestForecast.outletCount === 1 ? "" : "s"}` : latestForecast.status === "insufficient_data" ? "Waiting for enough sales history before forecasts can be produced" : `The last forecast run failed at ${latestForecast.trainedAt.toISOString()}. Open Demand Intelligence and run Train & generate forecast to retry.` }];
     return { checked_at: (/* @__PURE__ */ new Date()).toISOString(), services };
   } }),
   initializeCatalog: defineAction({ privileged: [privileged.supabaseData, privileged.verifySupabaseUser], request: external_exports.object({ auth_token: external_exports.string().optional().default("") }), response: external_exports.object({ ok: external_exports.literal(true) }), async handler(ctx, args) {
@@ -19172,14 +19172,20 @@ var Actions = {
           const staffing = staffingFor(row.predictedOrders, setting);
           return { id: id("STF"), outletId: row.outletId, forecastTimestamp: row.forecastTimestamp, forecastOrders: row.predictedOrders, baseStaff: staffing.base_staff, recommendedStaff: staffing.recommended_staff, modelVersion: row.modelVersion, createdAt };
         });
-        await db.batch([db.delete(demandForecasts).where(eq(demandForecasts.modelVersion, result.model_version)), db.insert(forecastRuns).values({ id: runId, trainedAt, generatedAt: createdAt, status: "completed", trainingRecords: result.training_records, outletCount: result.eligible_outlet_count, horizonHours: args.horizon_hours, mae: result.metrics?.mae ?? null, rmse: result.metrics?.rmse ?? null, mape: result.metrics?.mape ?? null, modelVersion: result.model_version, notes: result.message }), ...forecasts.map((row) => db.insert(demandForecasts).values(row)), ...plans.map((row) => db.insert(staffPlans).values(row).onConflictDoUpdate({ target: [staffPlans.outletId, staffPlans.forecastTimestamp, staffPlans.modelVersion], set: { forecastOrders: row.forecastOrders, baseStaff: row.baseStaff, recommendedStaff: row.recommendedStaff, createdAt } }))]);
+        const planTarget = [staffPlans.outletId, staffPlans.forecastTimestamp, staffPlans.modelVersion];
+        const writeStatements = [db.delete(demandForecasts).where(eq(demandForecasts.modelVersion, result.model_version)), db.insert(forecastRuns).values({ id: runId, trainedAt, generatedAt: createdAt, status: "completed", trainingRecords: result.training_records, outletCount: result.eligible_outlet_count, horizonHours: args.horizon_hours, mae: result.metrics?.mae ?? null, rmse: result.metrics?.rmse ?? null, mape: result.metrics?.mape ?? null, modelVersion: result.model_version, notes: result.message }), db.insert(demandForecasts).values(forecasts)];
+        const firstPlan = plans[0];
+        if (firstPlan) {
+          for (let start = 0; start < plans.length; start += 80) writeStatements.push(db.insert(staffPlans).values(plans.slice(start, start + 80)).onConflictDoUpdate({ target: planTarget, set: { forecastOrders: firstPlan.forecastOrders, baseStaff: firstPlan.baseStaff, recommendedStaff: firstPlan.recommendedStaff, createdAt } }));
+        }
+        await db.batch(writeStatements);
         ctx.invalidateQueries();
         return { ok: true, status: "completed", forecast_count: forecasts.length, message: result.message, run_id: runId };
       } catch (error51) {
         const message = error51 instanceof Error ? error51.message : "The forecast service could not complete.";
         await db.insert(forecastRuns).values({ id: runId, trainedAt, generatedAt: null, status: "failed", trainingRecords: observations.length, outletCount: eligible, horizonHours: args.horizon_hours, mae: null, rmse: null, mape: null, modelVersion: fallbackVersion, notes: message });
         ctx.invalidateQueries();
-        return { ok: false, status: "failed", forecast_count: 0, message: "The forecast service is unavailable. Existing forecasts are unchanged.", run_id: runId };
+        return { ok: false, status: "failed", forecast_count: 0, message: `${message} Existing forecasts are unchanged.`, run_id: runId };
       }
     }
   }),
@@ -19209,10 +19215,11 @@ var Actions = {
       const staffing = staffingFor(row.predictedOrders, setting);
       return { id: id("STF"), outletId: row.outletId, forecastTimestamp: row.forecastTimestamp, forecastOrders: row.predictedOrders, baseStaff: staffing.base_staff, recommendedStaff: staffing.recommended_staff, modelVersion: row.modelVersion, createdAt };
     });
-    const [firstPlan, ...remainingPlans] = plans;
+    const firstPlan = plans[0];
     if (!firstPlan) return { ok: false, rows: 0, error: "No forecast rows are available for your assigned outlets." };
-    const writePlan = (row) => db.insert(staffPlans).values(row).onConflictDoUpdate({ target: [staffPlans.outletId, staffPlans.forecastTimestamp, staffPlans.modelVersion], set: { forecastOrders: row.forecastOrders, baseStaff: row.baseStaff, recommendedStaff: row.recommendedStaff, createdAt } });
-    await db.batch([writePlan(firstPlan), ...remainingPlans.map(writePlan)]);
+    const planUpserts = [];
+    for (let start = 0; start < plans.length; start += 80) planUpserts.push(db.insert(staffPlans).values(plans.slice(start, start + 80)).onConflictDoUpdate({ target: [staffPlans.outletId, staffPlans.forecastTimestamp, staffPlans.modelVersion], set: { forecastOrders: firstPlan.forecastOrders, baseStaff: firstPlan.baseStaff, recommendedStaff: firstPlan.recommendedStaff, createdAt } }));
+    await db.batch(planUpserts);
     ctx.invalidateQueries();
     return { ok: true, rows: plans.length };
   } }),
@@ -19856,13 +19863,20 @@ async function runRemote(args, baseUrl) {
 async function runLocal(_args) {
   throw new Error("Set RETAILIQ_ML_SERVICE_URL to run anomaly analysis on Vercel.");
 }
+var FORECAST_REMOTE_TIMEOUT_MS = 45e3;
 async function runDemandRemote(args, baseUrl) {
-  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/forecast/generate`, { method: "POST", headers: { "content-type": "application/json", ...process.env.RETAILIQ_ML_SERVICE_TOKEN ? { authorization: `Bearer ${process.env.RETAILIQ_ML_SERVICE_TOKEN}` } : {} }, body: JSON.stringify(args), signal: AbortSignal.timeout(115e3) });
-  if (!response.ok) throw new Error(`Forecast service returned HTTP ${response.status}`);
+  let response;
+  try {
+    response = await fetch(`${baseUrl.replace(/\/$/, "")}/forecast/generate`, { method: "POST", headers: { "content-type": "application/json", ...process.env.RETAILIQ_ML_SERVICE_TOKEN ? { authorization: `Bearer ${process.env.RETAILIQ_ML_SERVICE_TOKEN}` } : {} }, body: JSON.stringify(args), signal: AbortSignal.timeout(FORECAST_REMOTE_TIMEOUT_MS) });
+  } catch (error51) {
+    if (error51 instanceof Error && (error51.name === "TimeoutError" || error51.name === "AbortError")) throw new Error(`The forecast service did not respond within ${Math.round(FORECAST_REMOTE_TIMEOUT_MS / 1e3)} seconds. It may still be starting up; no forecast was generated, so wait a few seconds and try again.`);
+    throw new Error("The forecast service could not be reached. No forecast was generated; check that the service is running and try again.");
+  }
+  if (!response.ok) throw new Error(`The forecast service returned HTTP ${response.status}; no forecast was generated.`);
   return privileged2.runDemandForecast.response.parse(await response.json());
 }
 async function runDemandLocal(_args) {
-  throw new Error("Set RETAILIQ_ML_SERVICE_URL to run demand forecasting on Vercel.");
+  throw new Error("Demand forecasting cannot run in this deployment because RETAILIQ_ML_SERVICE_URL is not set.");
 }
 function supabaseError(payload, status) {
   if (typeof payload.error_description === "string" && payload.error_description.trim()) return payload.error_description;
@@ -20348,15 +20362,22 @@ var privilegedHandlers = definePrivilegedHandlers(privileged2, {
       }
       const matching = db.query(`select "${assertName(primary)}" as key from "${table}"${operation.sql ? ` where ${operation.sql}` : ""}`).all(...operation.params ?? []);
       const changed = [];
+      if (operation.kind === "delete") {
+        const keys = matching.map((match) => String(match.key));
+        for (let start = 0; start < keys.length; start += 200) {
+          const list = keys.slice(start, start + 200).map((key) => `"${key.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`).join(",");
+          const filter = new URLSearchParams({ [assertName(primary)]: `in.(${list})` }).toString();
+          const response = await fetch(`${config2.url}/rest/v1/${table}?${filter}`, { method: "DELETE", headers: { ...headers, Prefer: "return=representation" }, signal: AbortSignal.timeout(3e4) });
+          if (!response.ok) throw new Error(`Supabase delete failed for ${table} (HTTP ${response.status}).`);
+          changed.push(...await response.json());
+        }
+        db.close();
+        results.push(changed);
+        continue;
+      }
       for (const match of matching) {
         const key = String(match.key);
         const target = `${config2.url}/rest/v1/${table}?${assertName(primary)}=eq.${encodeURIComponent(key)}`;
-        if (operation.kind === "delete") {
-          const response2 = await fetch(target, { method: "DELETE", headers: { ...headers, Prefer: "return=representation" }, signal: AbortSignal.timeout(3e4) });
-          if (!response2.ok) throw new Error(`Supabase delete failed for ${table} (HTTP ${response2.status}).`);
-          changed.push(...await response2.json());
-          continue;
-        }
         const values = { ...operation.values ?? {} };
         for (const [column, expression] of Object.entries(operation.expressions ?? {})) {
           const row = db.query(`select ${expression.sql} as value from "${table}" where "${assertName(primary)}"=?`).get(...expression.params, key);

@@ -238,14 +238,30 @@ async function runLocal(_args: AnalysisRequest): Promise<AnalysisResponse> {
   throw new Error("Set RETAILIQ_ML_SERVICE_URL to run anomaly analysis on Vercel.");
 }
 
+// Vercel Hobby caps this function at 60 seconds end to end, and data
+// assembly plus the write-back need a few of those. The remote budget is
+// therefore 45 seconds: waiting longer only lets the platform kill the
+// request with a 504 before the failure can be recorded honestly.
+const FORECAST_REMOTE_TIMEOUT_MS=45000;
 async function runDemandRemote(args: ForecastRequest, baseUrl: string): Promise<ForecastResponse> {
-  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/forecast/generate`, {method:"POST",headers:{"content-type":"application/json",...(process.env.RETAILIQ_ML_SERVICE_TOKEN?{authorization:`Bearer ${process.env.RETAILIQ_ML_SERVICE_TOKEN}`}:{})},body:JSON.stringify(args),signal:AbortSignal.timeout(115000)});
-  if(!response.ok)throw new Error(`Forecast service returned HTTP ${response.status}`);
+  let response: Response;
+  try{
+    response=await fetch(`${baseUrl.replace(/\/$/, "")}/forecast/generate`, {method:"POST",headers:{"content-type":"application/json",...(process.env.RETAILIQ_ML_SERVICE_TOKEN?{authorization:`Bearer ${process.env.RETAILIQ_ML_SERVICE_TOKEN}`}:{})},body:JSON.stringify(args),signal:AbortSignal.timeout(FORECAST_REMOTE_TIMEOUT_MS)});
+  }catch(error){
+    // A timeout means the service (which sleeps when idle on its free host)
+    // did not answer in time; a refused connection means it is unreachable.
+    // Report which one actually happened instead of a generic failure.
+    if(error instanceof Error&&(error.name==="TimeoutError"||error.name==="AbortError"))throw new Error(`The forecast service did not respond within ${Math.round(FORECAST_REMOTE_TIMEOUT_MS/1000)} seconds. It may still be starting up; no forecast was generated, so wait a few seconds and try again.`);
+    throw new Error("The forecast service could not be reached. No forecast was generated; check that the service is running and try again.");
+  }
+  if(!response.ok)throw new Error(`The forecast service returned HTTP ${response.status}; no forecast was generated.`);
   return privileged.runDemandForecast.response.parse(await response.json());
 }
 
 async function runDemandLocal(_args: ForecastRequest): Promise<ForecastResponse> {
-  throw new Error("Set RETAILIQ_ML_SERVICE_URL to run demand forecasting on Vercel.");
+  // Reached only when RETAILIQ_ML_SERVICE_URL is not set in this deployment:
+  // this host has no local forecast runner, so report exactly that.
+  throw new Error("Demand forecasting cannot run in this deployment because RETAILIQ_ML_SERVICE_URL is not set.");
 }
 
 type SupabaseTokenPayload={access_token?:unknown;refresh_token?:unknown;expires_in?:unknown;error_description?:unknown;msg?:unknown;message?:unknown};
@@ -626,11 +642,22 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       const primary=def.columns[0]?.name;if(!primary){db.close();throw new Error("Missing primary key definition.");}
       const matching=db.query(`select "${assertName(primary)}" as key from "${table}"${operation.sql?` where ${operation.sql}`:""}`).all(...(operation.params??[])) as Array<{key:unknown}>;
       const changed:Array<Record<string,unknown>>=[];
+      if(operation.kind==="delete"){
+        // One in.(...) request per chunk of keys instead of one DELETE per
+        // row: regenerating a forecast deletes hundreds of prior rows, and
+        // the per-row loop is what pushed bulk deletes past the 60s limit.
+        const keys=matching.map(match=>String(match.key));
+        for(let start=0;start<keys.length;start+=200){
+          const list=keys.slice(start,start+200).map(key=>`"${key.replace(/\\/g,"\\\\").replace(/"/g,'\\"')}"`).join(",");
+          const filter=new URLSearchParams({[assertName(primary)]:`in.(${list})`}).toString();
+          const response=await fetch(`${config.url}/rest/v1/${table}?${filter}`,{method:"DELETE",headers:{...headers,Prefer:"return=representation"},signal:AbortSignal.timeout(30000)});
+          if(!response.ok)throw new Error(`Supabase delete failed for ${table} (HTTP ${response.status}).`);
+          changed.push(...await response.json() as Array<Record<string,unknown>>);
+        }
+        db.close();results.push(changed);continue;
+      }
       for(const match of matching){
         const key=String(match.key);const target=`${config.url}/rest/v1/${table}?${assertName(primary)}=eq.${encodeURIComponent(key)}`;
-        if(operation.kind==="delete"){
-          const response=await fetch(target,{method:"DELETE",headers:{...headers,Prefer:"return=representation"},signal:AbortSignal.timeout(30000)});if(!response.ok)throw new Error(`Supabase delete failed for ${table} (HTTP ${response.status}).`);changed.push(...await response.json() as Array<Record<string,unknown>>);continue;
-        }
         const values:Record<string,unknown>={...(operation.values??{})};
         for(const [column,expression] of Object.entries(operation.expressions??{})){const row=db.query(`select ${expression.sql} as value from "${table}" where "${assertName(primary)}"=?`).get(...expression.params,key) as {value?:unknown}|null;values[assertName(column)]=row?.value??null;}
         const response=await fetch(target,{method:"PATCH",headers:{...headers,"content-type":"application/json",Prefer:"return=representation"},body:JSON.stringify(values),signal:AbortSignal.timeout(30000)});if(!response.ok)throw new Error(`Supabase update failed for ${table} (HTTP ${response.status}): ${(await response.text()).slice(0,240)}`);changed.push(...await response.json() as Array<Record<string,unknown>>);

@@ -139,7 +139,7 @@ class MutationBuilder implements PromiseLike<any> {
     this.operation.values = plain; this.operation.expressions = expressions; return this;
   }
   where(predicate: SQL | undefined) { if (predicate) { const rendered = render(predicate); this.operation.sql = rendered.sql; this.operation.params = rendered.params; } return this; }
-  onConflictDoNothing() { this.operation.ignoreConflict = true; return this; }
+  onConflictDoNothing(config?: { target: any | any[] }) { this.operation.ignoreConflict = true; if (config?.target) { const targets = Array.isArray(config.target) ? config.target : [config.target]; this.operation.conflict = targets.map(column => column.name as string); } return this; }
   onConflictDoUpdate(config: { target: any | any[]; set: Record<string, unknown> }) {
     const targets = Array.isArray(config.target) ? config.target : [config.target];
     this.operation.conflict = targets.map(column => column.name as string); this.set(config.set); return this;

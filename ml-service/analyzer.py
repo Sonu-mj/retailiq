@@ -6,10 +6,9 @@ action. It never invents production observations. Demo fixtures live separately.
 from __future__ import annotations
 
 from typing import Any
+import math
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import RobustScaler
 
 from config import CONFIG
 
@@ -153,6 +152,74 @@ def _anomaly_type(row: pd.Series) -> tuple[str, str, str, str]:
     return kind, summary, recommendation, related
 
 
+def _expected_path_length(n: int) -> float:
+    """Average path length of an unsuccessful search in a BST of n nodes."""
+    if n <= 1:
+        return 0.0
+    harmonic = math.log(n - 1) + 0.5772156649015329 + 1.0 / (2.0 * (n - 1))
+    return 2.0 * harmonic - 2.0 * (n - 1) / n
+
+
+def _build_isolation_tree(data: np.ndarray, depth: int, max_depth: int, rng: np.random.Generator):
+    size = len(data)
+    if size <= 1 or depth >= max_depth:
+        return ("leaf", size)
+    mins = data.min(axis=0)
+    maxs = data.max(axis=0)
+    valid = np.flatnonzero(maxs > mins)
+    if valid.size == 0:
+        return ("leaf", size)
+    feature = int(rng.choice(valid))
+    split = float(rng.uniform(mins[feature], maxs[feature]))
+    left_mask = data[:, feature] < split
+    left_size = int(left_mask.sum())
+    if left_size == 0 or left_size == size:
+        return ("leaf", size)
+    return (
+        "node", feature, split,
+        _build_isolation_tree(data[left_mask], depth + 1, max_depth, rng),
+        _build_isolation_tree(data[~left_mask], depth + 1, max_depth, rng),
+    )
+
+
+def _isolation_path_length(tree, row: np.ndarray) -> float:
+    depth = 0
+    node = tree
+    while node[0] == "node":
+        _, feature, split, left, right = node
+        node = left if row[feature] < split else right
+        depth += 1
+    return depth + _expected_path_length(node[1])
+
+
+def _isolation_forest_labels(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Isolation Forest (Liu et al.) implemented with NumPy only.
+
+    Returns (labels, raw_scores) where labels are -1 for the contamination
+    fraction with the shortest average isolation path, and raw_scores are
+    the anomaly score shifted so anomalous rows are positive - the same
+    convention the previous scikit-learn pipeline exposed.
+    """
+    n_rows = len(matrix)
+    subsample = min(256, n_rows)
+    max_depth = int(math.ceil(math.log2(max(subsample, 2))))
+    rng = np.random.default_rng(CONFIG.random_state)
+    trees = []
+    for _ in range(CONFIG.n_estimators):
+        indices = rng.choice(n_rows, size=subsample, replace=False) if subsample < n_rows else np.arange(n_rows)
+        trees.append(_build_isolation_tree(matrix[indices], 0, max_depth, rng))
+    normalizer = _expected_path_length(subsample)
+    expected_paths = np.array([
+        float(np.mean([_isolation_path_length(tree, row) for tree in trees]))
+        for row in matrix
+    ])
+    scores = np.power(2.0, -expected_paths / normalizer) if normalizer > 0 else np.full(n_rows, 0.5)
+    raw_scores = scores - 0.5
+    threshold = np.percentile(raw_scores, 100.0 * (1.0 - CONFIG.contamination))
+    labels = np.where(raw_scores > threshold, -1, 1)
+    return labels, raw_scores
+
+
 def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     features = build_features(payload)
     counts = features.groupby("outlet_id").size().to_dict() if not features.empty else {}
@@ -164,15 +231,16 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
             "message": f"Not enough historical data to establish a reliable baseline. Need at least {CONFIG.min_total_observations} daily observations overall and {CONFIG.min_observations_per_outlet} per outlet.",
         }
     model_frame = features[features["outlet_id"].isin(eligible)].copy()
-    matrix = RobustScaler().fit_transform(model_frame[FEATURE_COLUMNS].astype(float))
-    model = IsolationForest(
-        contamination=CONFIG.contamination,
-        random_state=CONFIG.random_state,
-        n_estimators=CONFIG.n_estimators,
-        n_jobs=-1,
-    )
-    labels = model.fit_predict(matrix)
-    raw_scores = -model.decision_function(matrix)
+    raw_values = model_frame[FEATURE_COLUMNS].astype(float).to_numpy()
+    # Robust scaling (median / IQR), matching the previous RobustScaler step
+    # without requiring scikit-learn on the host.
+    median = np.median(raw_values, axis=0)
+    q25 = np.percentile(raw_values, 25, axis=0)
+    q75 = np.percentile(raw_values, 75, axis=0)
+    scale = q75 - q25
+    scale[scale == 0.0] = 1.0
+    matrix = (raw_values - median) / scale
+    labels, raw_scores = _isolation_forest_labels(matrix)
     lo, hi = float(raw_scores.min()), float(raw_scores.max())
     normalized = np.full_like(raw_scores, 50.0) if hi == lo else (raw_scores - lo) / (hi - lo) * 100.0
     model_frame["label"] = labels

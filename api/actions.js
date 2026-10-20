@@ -18228,8 +18228,12 @@ var MutationBuilder = class {
     }
     return this;
   }
-  onConflictDoNothing() {
+  onConflictDoNothing(config2) {
     this.operation.ignoreConflict = true;
+    if (config2?.target) {
+      const targets = Array.isArray(config2.target) ? config2.target : [config2.target];
+      this.operation.conflict = targets.map((column) => column.name);
+    }
     return this;
   }
   onConflictDoUpdate(config2) {
@@ -18351,7 +18355,7 @@ var featureSnapshotSchema = external_exports.object({ sales_revenue: external_ex
 var anomalySchema = external_exports.object({ id: external_exports.string(), outlet_id: external_exports.string(), outlet_name: external_exports.string(), outlet_city: external_exports.string(), event_timestamp: external_exports.string(), anomaly_type: anomalyTypeSchema, severity: severitySchema, anomaly_score: external_exports.number(), raw_model_score: external_exports.number(), feature_snapshot: featureSnapshotSchema, summary: external_exports.string(), recommendation: external_exports.string(), related_bill_ids: external_exports.array(external_exports.string()), investigation_status: investigationSchema, model_version: external_exports.string(), created_at: external_exports.string() });
 var intelligenceRunSchema = external_exports.object({ id: external_exports.string(), started_at: external_exports.string(), completed_at: external_exports.string().nullable(), status: external_exports.enum(["completed", "insufficient_data", "failed"]), observation_count: external_exports.number(), outlet_count: external_exports.number(), signal_count: external_exports.number(), high_attention_count: external_exports.number(), model_version: external_exports.string(), notes: external_exports.string().nullable() });
 var forecastStatusSchema = external_exports.enum(["active", "waiting", "unavailable"]);
-var forecastRowSchema = external_exports.object({ id: external_exports.string(), outlet_id: external_exports.string(), outlet_name: external_exports.string(), forecast_timestamp: external_exports.string(), predicted_orders: external_exports.number(), model_version: external_exports.string(), base_staff: external_exports.number(), recommended_staff: external_exports.number(), scheduled_staff: external_exports.number().nullable(), staffing_gap: external_exports.number().nullable() });
+var forecastRowSchema = external_exports.object({ id: external_exports.string(), plan_id: external_exports.string().nullable(), outlet_id: external_exports.string(), outlet_name: external_exports.string(), forecast_timestamp: external_exports.string(), predicted_orders: external_exports.number(), model_version: external_exports.string(), base_staff: external_exports.number(), recommended_staff: external_exports.number(), scheduled_staff: external_exports.number().nullable(), staffing_gap: external_exports.number().nullable() });
 var historicalDemandSchema = external_exports.object({ outlet_id: external_exports.string(), outlet_name: external_exports.string(), timestamp: external_exports.string(), orders: external_exports.number(), units_sold: external_exports.number(), revenue: external_exports.number(), average_order_value: external_exports.number() });
 var workforceSchema = external_exports.object({ id: external_exports.string(), orders_per_staff_hour: external_exports.number(), staffing_buffer_percent: external_exports.number(), minimum_staff: external_exports.number(), maximum_staff: external_exports.number(), updated_at: external_exports.string() });
 var forecastRunSchema = external_exports.object({ id: external_exports.string(), trained_at: external_exports.string(), generated_at: external_exports.string().nullable(), status: external_exports.enum(["completed", "insufficient_data", "failed"]), training_records: external_exports.number(), outlet_count: external_exports.number(), horizon_hours: external_exports.number(), mae: external_exports.number().nullable(), rmse: external_exports.number().nullable(), mape: external_exports.number().nullable(), model_version: external_exports.string(), notes: external_exports.string().nullable() });
@@ -19243,7 +19247,7 @@ var Actions = {
       const planMap = new Map(planRows.filter((row) => !activeVersion || row.modelVersion === activeVersion).map((row) => [`${row.outletId}|${row.forecastTimestamp.toISOString()}`, row]));
       const forecasts = forecastRows.filter((row) => allowed.has(row.outletId) && (!activeVersion || row.modelVersion === activeVersion) && (!args.outlet_id || row.outletId === args.outlet_id) && row.forecastTimestamp.getTime() <= cutoff).map((row) => {
         const plan = planMap.get(`${row.outletId}|${row.forecastTimestamp.toISOString()}`);
-        return { id: row.id, outlet_id: row.outletId, outlet_name: names.get(row.outletId) ?? row.outletId, forecast_timestamp: row.forecastTimestamp.toISOString(), predicted_orders: row.predictedOrders, model_version: row.modelVersion, base_staff: plan?.baseStaff ?? staffingFor(row.predictedOrders, settingRows[0] ?? { ordersPerStaffHour: 10, staffingBufferPercent: 10, minimumStaff: 1, maximumStaff: 8 }).base_staff, recommended_staff: plan?.recommendedStaff ?? staffingFor(row.predictedOrders, settingRows[0] ?? { ordersPerStaffHour: 10, staffingBufferPercent: 10, minimumStaff: 1, maximumStaff: 8 }).recommended_staff, scheduled_staff: plan?.scheduledStaff ?? null, staffing_gap: plan?.scheduledStaff == null ? null : plan.scheduledStaff - plan.recommendedStaff };
+        return { id: row.id, plan_id: plan?.id ?? null, outlet_id: row.outletId, outlet_name: names.get(row.outletId) ?? row.outletId, forecast_timestamp: row.forecastTimestamp.toISOString(), predicted_orders: row.predictedOrders, model_version: row.modelVersion, base_staff: plan?.baseStaff ?? staffingFor(row.predictedOrders, settingRows[0] ?? { ordersPerStaffHour: 10, staffingBufferPercent: 10, minimumStaff: 1, maximumStaff: 8 }).base_staff, recommended_staff: plan?.recommendedStaff ?? staffingFor(row.predictedOrders, settingRows[0] ?? { ordersPerStaffHour: 10, staffingBufferPercent: 10, minimumStaff: 1, maximumStaff: 8 }).recommended_staff, scheduled_staff: plan?.scheduledStaff ?? null, staffing_gap: plan?.scheduledStaff == null ? null : plan.scheduledStaff - plan.recommendedStaff };
       });
       const history = aggregateHourlyDemand(saleRows.filter((row) => allowed.has(row.outletId))).filter((row) => (!args.outlet_id || row.outlet_id === args.outlet_id) && new Date(row.timestamp).getTime() >= start).map((row) => ({ ...row, outlet_name: names.get(row.outlet_id) ?? row.outlet_id }));
       const setting = settingRows[0] ?? { id: "WORKFORCE_GLOBAL", ordersPerStaffHour: 10, staffingBufferPercent: 10, minimumStaff: 1, maximumStaff: 8, updatedAt: /* @__PURE__ */ new Date() };
@@ -19337,7 +19341,8 @@ var Actions = {
       const medianRevenue = [...profitRows].map((row) => row.gross_sales).sort((a, b) => a - b)[Math.floor(profitRows.length / 2)] ?? 0;
       const periodKey = `${start.toISOString().slice(0, 10)}:${end.toISOString().slice(0, 10)}`;
       const candidates = [];
-      const addInsight = (outletId, type, severity, title, description, entityType, entityId) => candidates.push({ id: id("INS"), outletId, generatedAt: now, insightType: type, severity, title, description, relatedEntityType: entityType, relatedEntityId: entityId, dedupeKey: `${type}|${outletId}|${periodKey}|${entityId}`, status: "new", createdAt: now, updatedAt: now });
+      const insightStamp = end.getTime() < now.getTime() ? end : now;
+      const addInsight = (outletId, type, severity, title, description, entityType, entityId) => candidates.push({ id: id("INS"), outletId, generatedAt: insightStamp, insightType: type, severity, title, description, relatedEntityType: entityType, relatedEntityId: entityId, dedupeKey: `${type}|${outletId}|${periodKey}|${entityId}`, status: "new", createdAt: insightStamp, updatedAt: insightStamp });
       for (const row of profitRows) {
         const returnRate = row.gross_sales > 0 ? row.returns / row.gross_sales : 0;
         const wasteRate = row.net_sales > 0 ? row.wastage / row.net_sales : 0;
@@ -19352,7 +19357,12 @@ var Actions = {
       for (const { event, outletName } of unresolved) {
         addInsight(event.outletId, "anomaly", event.severity, `${outletName}: ${event.summary}`, `An unresolved ${event.severity.replaceAll("_", " ")} model signal requires review.`, "anomaly", event.id);
       }
-      for (const candidate of candidates) await db.insert(businessInsights).values(candidate).onConflictDoNothing();
+      for (const candidate of candidates) {
+        try {
+          await db.insert(businessInsights).values(candidate).onConflictDoNothing({ target: businessInsights.dedupeKey });
+        } catch {
+        }
+      }
       const insightRows = (await db.select({ row: businessInsights, outletName: outlets.name }).from(businessInsights).leftJoin(outlets, eq(businessInsights.outletId, outlets.id)).orderBy(desc(businessInsights.generatedAt)).limit(100)).filter(({ row }) => row.generatedAt >= start && row.generatedAt <= end);
       const outletData = profitRows.map((row) => {
         const f = activeForecasts.filter((item) => item.outletId === row.outlet_id);
@@ -19373,6 +19383,12 @@ var Actions = {
         const day = trendMap.get(key) ?? { revenue: 0, contribution: 0 };
         day.revenue += item.lineTotal;
         day.contribution += item.lineTotal - item.costPrice * item.quantity;
+        trendMap.set(key, day);
+      }
+      for (const { row, item } of returnRows.filter(({ row: row2 }) => scopedIds.has(row2.outletId))) {
+        const key = row.returnTimestamp.toISOString().slice(0, 10);
+        const day = trendMap.get(key) ?? { revenue: 0, contribution: 0 };
+        day.contribution -= row.returnAmount - item.costPrice * row.quantity;
         trendMap.set(key, day);
       }
       const nextMap = /* @__PURE__ */ new Map();

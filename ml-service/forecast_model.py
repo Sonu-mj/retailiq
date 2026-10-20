@@ -13,8 +13,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 MODEL_VERSION = "hist-gradient-hourly-v1"
 MIN_DAYS = 21
@@ -73,9 +71,182 @@ def build_hourly_features(observations: list[dict[str, Any]]) -> tuple[pd.DataFr
     return result, decode
 
 
+class HistogramGradientBoostingRegressor:
+    """Histogram-based gradient boosting for squared loss, NumPy only.
+
+    Mirrors the scikit-learn HistGradientBoostingRegressor configuration this
+    module previously used (binned features, leaf-wise growth, L2 leaf
+    regularization) so forecasts keep the same model version and behaviour
+    without requiring scikit-learn on the host.
+    """
+
+    def __init__(self, max_iter: int = 240, learning_rate: float = 0.06, max_leaf_nodes: int = 23,
+                 l2_regularization: float = 0.15, min_samples_leaf: int = 20, max_bins: int = 64,
+                 random_state: int = 42):
+        self.max_iter = max_iter
+        self.learning_rate = learning_rate
+        self.max_leaf_nodes = max_leaf_nodes
+        self.l2_regularization = l2_regularization
+        self.min_samples_leaf = min_samples_leaf
+        self.max_bins = max_bins
+        self.random_state = random_state
+        self.bin_thresholds: list[np.ndarray] = []
+        self.trees: list[dict[str, np.ndarray]] = []
+        self.init_prediction = 0.0
+
+    def _bin(self, values: np.ndarray) -> np.ndarray:
+        binned = np.empty(values.shape, dtype=np.int32)
+        for j in range(values.shape[1]):
+            binned[:, j] = np.searchsorted(self.bin_thresholds[j], values[:, j], side="right")
+        return binned
+
+    def _fit_bin_thresholds(self, values: np.ndarray) -> None:
+        self.bin_thresholds = []
+        for j in range(values.shape[1]):
+            column = values[:, j]
+            uniques = np.unique(column)
+            if len(uniques) <= self.max_bins:
+                thresholds = (uniques[:-1] + uniques[1:]) / 2.0
+            else:
+                quantiles = np.linspace(0.0, 1.0, self.max_bins + 1)[1:-1]
+                thresholds = np.unique(np.quantile(column, quantiles))
+            self.bin_thresholds.append(np.asarray(thresholds, dtype=float))
+
+    def _best_split(self, binned: np.ndarray, residuals: np.ndarray, indices: np.ndarray):
+        total = float(residuals[indices].sum())
+        count = len(indices)
+        base = total * total / (count + self.l2_regularization)
+        best: tuple[float, int, int] | None = None
+        for feature in range(binned.shape[1]):
+            n_bins = int(binned[indices, feature].max()) + 1 if count else 0
+            if n_bins < 2:
+                continue
+            sums = np.bincount(binned[indices, feature], weights=residuals[indices], minlength=n_bins)
+            counts = np.bincount(binned[indices, feature], minlength=n_bins)
+            cum_sum = np.cumsum(sums)[:-1]
+            cum_count = np.cumsum(counts)[:-1]
+            valid = (cum_count >= self.min_samples_leaf) & ((count - cum_count) >= self.min_samples_leaf)
+            if not valid.any():
+                continue
+            gains = (cum_sum * cum_sum / (cum_count + self.l2_regularization)
+                     + (total - cum_sum) ** 2 / ((count - cum_count) + self.l2_regularization) - base)
+            gains = np.where(valid, gains, -np.inf)
+            split = int(np.argmax(gains))
+            gain = float(gains[split])
+            if best is None or gain > best[0]:
+                best = (gain, feature, split)
+        return best
+
+    def _grow_tree(self, binned: np.ndarray, residuals: np.ndarray) -> dict[str, np.ndarray]:
+        features: list[int] = []
+        thresholds: list[int] = []
+        lefts: list[int] = []
+        rights: list[int] = []
+        leaf_values: list[float] = []
+        leaf_indices: list[np.ndarray | None] = [np.arange(len(residuals))]
+        leaf_best: list[tuple[float, int, int] | None] = [self._best_split(binned, residuals, leaf_indices[0])]
+        n_nodes = 1
+        while n_nodes < self.max_leaf_nodes:
+            candidate: tuple[float, int] | None = None
+            for leaf_id, best in enumerate(leaf_best):
+                if best is not None and best[0] > 0 and (candidate is None or best[0] > candidate[0]):
+                    candidate = (best[0], leaf_id)
+            if candidate is None:
+                break
+            leaf_id = candidate[1]
+            best = leaf_best[leaf_id]
+            if best is None or leaf_indices[leaf_id] is None:
+                break
+            _, feature, split = best
+            indices = leaf_indices[leaf_id]
+            goes_left = binned[indices, feature] <= split
+            left_idx = indices[goes_left]
+            right_idx = indices[~goes_left]
+            left_id = len(leaf_indices)
+            right_id = left_id + 1
+            while len(features) < leaf_id + 1:
+                features.append(-1); thresholds.append(-1); lefts.append(-1); rights.append(-1); leaf_values.append(0.0)
+            features[leaf_id] = feature
+            thresholds[leaf_id] = split
+            lefts[leaf_id] = left_id
+            rights[leaf_id] = right_id
+            leaf_indices[leaf_id] = None
+            leaf_best[leaf_id] = None
+            leaf_indices.extend([left_idx, right_idx])
+            leaf_best.extend([
+                self._best_split(binned, residuals, left_idx),
+                self._best_split(binned, residuals, right_idx),
+            ])
+            n_nodes += 1
+        size = len(leaf_indices)
+        while len(features) < size:
+            features.append(-1); thresholds.append(-1); lefts.append(-1); rights.append(-1); leaf_values.append(0.0)
+        for leaf_id, indices in enumerate(leaf_indices):
+            if indices is None:
+                continue
+            leaf_values[leaf_id] = float(residuals[indices].sum() / (len(indices) + self.l2_regularization)) if len(indices) else 0.0
+        return {
+            "feature": np.array(features, dtype=int), "threshold": np.array(thresholds, dtype=int),
+            "left": np.array(lefts, dtype=int), "right": np.array(rights, dtype=int),
+            "value": np.array(leaf_values, dtype=float),
+        }
+
+    def _tree_predict_binned(self, tree: dict[str, np.ndarray], binned: np.ndarray) -> np.ndarray:
+        node = np.zeros(len(binned), dtype=int)
+        active = tree["feature"][node] >= 0
+        while active.any():
+            rows = np.flatnonzero(active)
+            current = node[rows]
+            goes_left = binned[rows, tree["feature"][current]] <= tree["threshold"][current]
+            node[rows] = np.where(goes_left, tree["left"][current], tree["right"][current])
+            active = tree["feature"][node] >= 0
+        return tree["value"][node]
+
+    def fit(self, frame: pd.DataFrame, target: pd.Series) -> "HistogramGradientBoostingRegressor":
+        values = frame.to_numpy(dtype=float)
+        y = target.to_numpy(dtype=float)
+        self._fit_bin_thresholds(values)
+        binned = self._bin(values)
+        self.init_prediction = float(np.mean(y)) if len(y) else 0.0
+        prediction = np.full(len(y), self.init_prediction)
+        self.trees = []
+        for _ in range(self.max_iter):
+            residuals = y - prediction
+            if len(residuals) == 0 or float(np.max(np.abs(residuals))) < 1e-9:
+                break
+            tree = self._grow_tree(binned, residuals)
+            update = self._tree_predict_binned(tree, binned)
+            if not np.any(update):
+                break
+            self.trees.append(tree)
+            prediction = prediction + self.learning_rate * update
+        return self
+
+    def _predict_single(self, binned_row: np.ndarray) -> float:
+        total = self.init_prediction
+        for tree in self.trees:
+            node = 0
+            features = tree["feature"]
+            while features[node] >= 0:
+                feature = int(features[node])
+                node = int(tree["left"][node]) if binned_row[feature] <= tree["threshold"][node] else int(tree["right"][node])
+            total += self.learning_rate * float(tree["value"][node])
+        return total
+
+    def predict(self, frame: pd.DataFrame) -> np.ndarray:
+        values = frame.to_numpy(dtype=float)
+        binned = self._bin(values)
+        if len(values) == 1:
+            return np.array([self._predict_single(binned[0])])
+        prediction = np.full(len(values), self.init_prediction)
+        for tree in self.trees:
+            prediction = prediction + self.learning_rate * self._tree_predict_binned(tree, binned)
+        return prediction
+
+
 @dataclass
 class TrainedDemandModel:
-    model: HistGradientBoostingRegressor
+    model: HistogramGradientBoostingRegressor
     decode: dict[int, str]
     history: pd.DataFrame
     metrics: dict[str, float | None]
@@ -87,8 +258,8 @@ def train_demand_model(observations: list[dict[str, Any]]) -> TrainedDemandModel
         return None
     eligible_ids = []
     for outlet_id, group in frame.groupby("outlet_id"):
-        span_days = (group["timestamp"].max() - group["timestamp"].min()).total_seconds() / 86400
-        if len(group) >= MIN_ROWS_PER_OUTLET and span_days >= MIN_DAYS:
+        distinct_days = int(group["timestamp"].dt.date.nunique())
+        if len(group) >= MIN_ROWS_PER_OUTLET and distinct_days >= MIN_DAYS:
             eligible_ids.append(outlet_id)
     frame = frame[frame["outlet_id"].isin(eligible_ids)].dropna(subset=FEATURES + ["orders"]).copy()
     if len(frame) < 168 or not eligible_ids:
@@ -98,13 +269,14 @@ def train_demand_model(observations: list[dict[str, Any]]) -> TrainedDemandModel
     train, test = frame.iloc[:split], frame.iloc[split:]
     if test.empty:
         return None
-    model = HistGradientBoostingRegressor(max_iter=240, learning_rate=0.06, max_leaf_nodes=23, l2_regularization=0.15, random_state=42)
+    model = HistogramGradientBoostingRegressor(max_iter=240, learning_rate=0.06, max_leaf_nodes=23, l2_regularization=0.15, random_state=42)
     model.fit(train[FEATURES], train["orders"])
     predicted = np.maximum(0.0, model.predict(test[FEATURES]))
     actual = test["orders"].to_numpy()
     nonzero = actual != 0
     mape = float(np.mean(np.abs((actual[nonzero] - predicted[nonzero]) / actual[nonzero])) * 100) if nonzero.any() else None
-    metrics = {"mae": float(mean_absolute_error(actual, predicted)), "rmse": float(sqrt(mean_squared_error(actual, predicted))), "mape": mape}
+    errors = actual - predicted
+    metrics = {"mae": float(np.mean(np.abs(errors))), "rmse": float(sqrt(np.mean(errors ** 2))), "mape": mape}
     model.fit(frame[FEATURES], frame["orders"])
     return TrainedDemandModel(model=model, decode=decode, history=frame, metrics=metrics)
 

@@ -107,6 +107,37 @@ export const privileged = definePrivilegedContracts({
     }),
     timeoutMs:120000,
   },
+  startDemandForecastJob: {
+    request: z.object({
+      observations: z.array(z.object({outlet_id:z.string(),timestamp:z.string(),orders:z.number(),units_sold:z.number(),revenue:z.number(),average_order_value:z.number()})),
+      horizon_hours: z.number().int().min(24).max(168),
+    }),
+    response: z.object({
+      state: z.enum(["running","completed","starting","failed"]),
+      job_id: z.string(),
+      message: z.string(),
+      result: z.object({
+        status:z.enum(["completed","insufficient_data"]), model_version:z.string(), training_records:z.number().int().nonnegative(), eligible_outlet_count:z.number().int().nonnegative(), message:z.string(),
+        metrics:z.object({mae:z.number(),rmse:z.number(),mape:z.number().nullable()}).nullable(),
+        forecasts:z.array(z.object({outlet_id:z.string(),forecast_timestamp:z.string(),predicted_orders:z.number().nonnegative()})),
+      }).nullable(),
+    }),
+    timeoutMs:30000,
+  },
+  pollDemandForecastJob: {
+    request: z.object({job_id: z.string().min(1)}),
+    response: z.object({
+      state: z.enum(["running","completed","starting","failed"]),
+      job_id: z.string(),
+      message: z.string(),
+      result: z.object({
+        status:z.enum(["completed","insufficient_data"]), model_version:z.string(), training_records:z.number().int().nonnegative(), eligible_outlet_count:z.number().int().nonnegative(), message:z.string(),
+        metrics:z.object({mae:z.number(),rmse:z.number(),mape:z.number().nullable()}).nullable(),
+        forecasts:z.array(z.object({outlet_id:z.string(),forecast_timestamp:z.string(),predicted_orders:z.number().nonnegative()})),
+      }).nullable(),
+    }),
+    timeoutMs:30000,
+  },
   getSupabaseAuthConfig: {
     request: z.object({}),
     response: z.object({
@@ -222,6 +253,8 @@ type AnalysisRequest = z.infer<typeof privileged.runIsolationForest.request>;
 type AnalysisResponse = z.infer<typeof privileged.runIsolationForest.response>;
 type ForecastRequest = z.infer<typeof privileged.runDemandForecast.request>;
 type ForecastResponse = z.infer<typeof privileged.runDemandForecast.response>;
+type ForecastJobResponse = z.infer<typeof privileged.startDemandForecastJob.response>;
+const forecastResultSchema = privileged.runDemandForecast.response;
 
 async function runRemote(args: AnalysisRequest, baseUrl: string): Promise<AnalysisResponse> {
   const response = await fetch(`${baseUrl.replace(/\/$/, "")}/ml/analyze`, {
@@ -256,6 +289,46 @@ async function runDemandRemote(args: ForecastRequest, baseUrl: string): Promise<
   }
   if(!response.ok)throw new Error(`The forecast service returned HTTP ${response.status}; no forecast was generated.`);
   return privileged.runDemandForecast.response.parse(await response.json());
+}
+
+// Each start/poll request gets a short budget so no single call can approach
+// the 60-second function limit; the client retries starts while the service
+// wakes and polls while it computes in the background.
+const FORECAST_JOB_REQUEST_TIMEOUT_MS=12000;
+function mlHeaders(){return{"content-type":"application/json",...(process.env.RETAILIQ_ML_SERVICE_TOKEN?{authorization:`Bearer ${process.env.RETAILIQ_ML_SERVICE_TOKEN}`}:{})}}
+async function startDemandJobRemote(args: ForecastRequest, baseUrl: string): Promise<ForecastJobResponse> {
+  let response: Response;
+  try{
+    response=await fetch(`${baseUrl.replace(/\/$/, "")}/forecast/jobs`, {method:"POST",headers:mlHeaders(),body:JSON.stringify(args),signal:AbortSignal.timeout(FORECAST_JOB_REQUEST_TIMEOUT_MS)});
+  }catch{
+    return{state:"starting",job_id:"",message:"The forecast service is starting up.",result:null};
+  }
+  if(response.status===404||response.status>=500)return{state:"starting",job_id:"",message:"The forecast service is starting up.",result:null};
+  if(!response.ok)return{state:"failed",job_id:"",message:`The forecast service returned HTTP ${response.status}; no forecast was generated.`,result:null};
+  const payload=await response.json().catch(()=>null) as {job_id?:unknown}|null;
+  if(typeof payload?.job_id!=="string"||!payload.job_id)return{state:"failed",job_id:"",message:"The forecast service did not return a job id; no forecast was generated.",result:null};
+  return{state:"running",job_id:payload.job_id,message:"Forecast generation started.",result:null};
+}
+
+async function pollDemandJobRemote(jobId: string, baseUrl: string): Promise<ForecastJobResponse> {
+  let response: Response;
+  try{
+    response=await fetch(`${baseUrl.replace(/\/$/, "")}/forecast/jobs/${encodeURIComponent(jobId)}`, {method:"GET",headers:mlHeaders(),signal:AbortSignal.timeout(FORECAST_JOB_REQUEST_TIMEOUT_MS)});
+  }catch{
+    return{state:"running",job_id:jobId,message:"Forecast is still generating.",result:null};
+  }
+  if(response.status===404)return{state:"failed",job_id:jobId,message:"The forecast job is no longer available on the service (it may have restarted). Start the forecast again; no forecast was generated.",result:null};
+  if(response.status>=500)return{state:"running",job_id:jobId,message:"Forecast is still generating.",result:null};
+  if(!response.ok)return{state:"failed",job_id:jobId,message:`The forecast service returned HTTP ${response.status}; no forecast was generated.`,result:null};
+  const payload=await response.json().catch(()=>null) as {status?:unknown;result?:unknown;error?:unknown}|null;
+  if(payload?.status==="running")return{state:"running",job_id:jobId,message:"Forecast is still generating.",result:null};
+  if(payload?.status==="failed")return{state:"failed",job_id:jobId,message:typeof payload.error==="string"&&payload.error?payload.error:"The forecast service could not complete the job.",result:null};
+  if(payload?.status==="completed"){
+    const parsed=forecastResultSchema.safeParse(payload.result);
+    if(!parsed.success)return{state:"failed",job_id:jobId,message:"The forecast service returned an unreadable result; no forecast was generated.",result:null};
+    return{state:"completed",job_id:jobId,message:parsed.data.message,result:parsed.data};
+  }
+  return{state:"failed",job_id:jobId,message:"The forecast service returned an unexpected job status; no forecast was generated.",result:null};
 }
 
 async function runDemandLocal(_args: ForecastRequest): Promise<ForecastResponse> {
@@ -355,6 +428,16 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
   async runDemandForecast(args){
     const remote=process.env.RETAILIQ_ML_SERVICE_URL?.trim();
     return remote?runDemandRemote(args,remote):runDemandLocal(args);
+  },
+  async startDemandForecastJob(args){
+    const remote=process.env.RETAILIQ_ML_SERVICE_URL?.trim();
+    if(!remote)return{state:"failed" as const,job_id:"",message:"Demand forecasting cannot run in this deployment because RETAILIQ_ML_SERVICE_URL is not set.",result:null};
+    return startDemandJobRemote(args,remote);
+  },
+  async pollDemandForecastJob(args){
+    const remote=process.env.RETAILIQ_ML_SERVICE_URL?.trim();
+    if(!remote)return{state:"failed" as const,job_id:args.job_id,message:"Demand forecasting cannot run in this deployment because RETAILIQ_ML_SERVICE_URL is not set.",result:null};
+    return pollDemandJobRemote(args.job_id,remote);
   },
   async getSupabaseAuthConfig(){
     const redirectUrl=process.env.RETAILIQ_AUTH_REDIRECT_URL?.trim()??"";

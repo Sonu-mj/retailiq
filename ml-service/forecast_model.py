@@ -269,7 +269,7 @@ def train_demand_model(observations: list[dict[str, Any]]) -> TrainedDemandModel
     train, test = frame.iloc[:split], frame.iloc[split:]
     if test.empty:
         return None
-    model = HistogramGradientBoostingRegressor(max_iter=240, learning_rate=0.06, max_leaf_nodes=23, l2_regularization=0.15, random_state=42)
+    model = HistogramGradientBoostingRegressor(max_iter=160, learning_rate=0.06, max_leaf_nodes=23, l2_regularization=0.15, random_state=42)
     model.fit(train[FEATURES], train["orders"])
     predicted = np.maximum(0.0, model.predict(test[FEATURES]))
     actual = test["orders"].to_numpy()

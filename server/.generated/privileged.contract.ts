@@ -39,6 +39,37 @@ export const privileged = definePrivilegedContracts({
     }),
     timeoutMs:120000,
   },
+  startDemandForecastJob: {
+    request: z.object({
+      observations: z.array(z.object({outlet_id:z.string(),timestamp:z.string(),orders:z.number(),units_sold:z.number(),revenue:z.number(),average_order_value:z.number()})),
+      horizon_hours: z.number().int().min(24).max(168),
+    }),
+    response: z.object({
+      state: z.enum(["running","completed","starting","failed"]),
+      job_id: z.string(),
+      message: z.string(),
+      result: z.object({
+        status:z.enum(["completed","insufficient_data"]), model_version:z.string(), training_records:z.number().int().nonnegative(), eligible_outlet_count:z.number().int().nonnegative(), message:z.string(),
+        metrics:z.object({mae:z.number(),rmse:z.number(),mape:z.number().nullable()}).nullable(),
+        forecasts:z.array(z.object({outlet_id:z.string(),forecast_timestamp:z.string(),predicted_orders:z.number().nonnegative()})),
+      }).nullable(),
+    }),
+    timeoutMs:30000,
+  },
+  pollDemandForecastJob: {
+    request: z.object({job_id: z.string().min(1)}),
+    response: z.object({
+      state: z.enum(["running","completed","starting","failed"]),
+      job_id: z.string(),
+      message: z.string(),
+      result: z.object({
+        status:z.enum(["completed","insufficient_data"]), model_version:z.string(), training_records:z.number().int().nonnegative(), eligible_outlet_count:z.number().int().nonnegative(), message:z.string(),
+        metrics:z.object({mae:z.number(),rmse:z.number(),mape:z.number().nullable()}).nullable(),
+        forecasts:z.array(z.object({outlet_id:z.string(),forecast_timestamp:z.string(),predicted_orders:z.number().nonnegative()})),
+      }).nullable(),
+    }),
+    timeoutMs:30000,
+  },
   getSupabaseAuthConfig: {
     request: z.object({}),
     response: z.object({

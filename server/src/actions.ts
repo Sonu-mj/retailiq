@@ -69,6 +69,26 @@ const inventoryRowSchema=z.object({id:z.string(),outlet_id:z.string(),outlet_nam
 const movementSchema=z.object({id:z.string(),outlet_id:z.string(),outlet_name:z.string(),product_id:z.string(),product_name:z.string(),movement_type:movementTypeSchema,quantity:z.number(),reference_type:z.string(),reference_id:z.string(),unit_cost:z.number().nullable(),notes:z.string().nullable(),created_by:z.string(),created_at:z.string()});
 function stockStatus(current:number,reorder:number,minimum:number):z.infer<typeof stockStatusSchema>{if(current<=0)return"out_of_stock";if(current<=minimum)return"critical";if(current<=reorder)return"low_stock";return"healthy";}
 
+type ForecastResultPayload={status:"completed"|"insufficient_data";model_version:string;training_records:number;eligible_outlet_count:number;message:string;metrics:{mae:number;rmse:number;mape:number|null}|null;forecasts:Array<{outlet_id:string;forecast_timestamp:string;predicted_orders:number}>};
+// Bulk-persist a finished forecast: one operation carries every forecast row
+// and the staff plans go in chunks of 80 rows per operation. (An earlier shape
+// sent one database request per row, which pushed runs past the host limit.)
+async function persistForecastResult(db:ReturnType<typeof supabaseDb>,result:ForecastResultPayload,horizonHours:number,runId:string,trainedAt:Date){
+  const setting=(await db.select().from(schema.workforceSettings).where(eq(schema.workforceSettings.id,"WORKFORCE_GLOBAL")).limit(1))[0]??{ordersPerStaffHour:10,staffingBufferPercent:10,minimumStaff:1,maximumStaff:8};
+  const createdAt=new Date();
+  const forecasts:typeof schema.demandForecasts.$inferInsert[]=result.forecasts.map(row=>({id:id("FC"),outletId:row.outlet_id,forecastTimestamp:new Date(row.forecast_timestamp),predictedOrders:money(row.predicted_orders),lowerBound:null,upperBound:null,modelVersion:result.model_version,createdAt}));
+  const plans:typeof schema.staffPlans.$inferInsert[]=forecasts.map(row=>{const staffing=staffingFor(row.predictedOrders,setting);return{id:id("STF"),outletId:row.outletId,forecastTimestamp:row.forecastTimestamp,forecastOrders:row.predictedOrders,baseStaff:staffing.base_staff,recommendedStaff:staffing.recommended_staff,modelVersion:row.modelVersion,createdAt}});
+  const planTarget=[schema.staffPlans.outletId,schema.staffPlans.forecastTimestamp,schema.staffPlans.modelVersion];
+  const writeStatements=[db.delete(schema.demandForecasts).where(eq(schema.demandForecasts.modelVersion,result.model_version)),db.insert(schema.forecastRuns).values({id:runId,trainedAt,generatedAt:createdAt,status:"completed",trainingRecords:result.training_records,outletCount:result.eligible_outlet_count,horizonHours,mae:result.metrics?.mae??null,rmse:result.metrics?.rmse??null,mape:result.metrics?.mape??null,modelVersion:result.model_version,notes:result.message}),db.insert(schema.demandForecasts).values(forecasts)];
+  const firstPlan=plans[0];
+  if(firstPlan){for(let start=0;start<plans.length;start+=80)writeStatements.push(db.insert(schema.staffPlans).values(plans.slice(start,start+80)).onConflictDoUpdate({target:planTarget,set:{forecastOrders:firstPlan.forecastOrders,baseStaff:firstPlan.baseStaff,recommendedStaff:firstPlan.recommendedStaff,createdAt}}));}
+  await db.batch(writeStatements);
+  return forecasts.length;
+}
+async function recordForecastRun(db:ReturnType<typeof supabaseDb>,runId:string,trainedAt:Date,status:"insufficient_data"|"failed",trainingRecords:number,outletCount:number,horizonHours:number,modelVersion:string,notes:string){
+  await db.insert(schema.forecastRuns).values({id:runId,trainedAt,generatedAt:null,status,trainingRecords,outletCount,horizonHours,mae:null,rmse:null,mape:null,modelVersion,notes});
+}
+
 export const Actions = {
   getAuthConfig: defineAction({privileged:[privileged.supabaseData,privileged.getSupabaseAuthConfig],request:z.object({}),response:z.object({configured:z.boolean(),supabase_url:z.string(),anon_key:z.string(),redirect_url:z.string()}),async handler(ctx){return ctx.executePrivileged(privileged.getSupabaseAuthConfig,{})}}),
   signInWithSupabase: defineAction({privileged:[privileged.supabaseData,privileged.signInWithSupabase],request:z.object({email:z.string().trim().email(),password:z.string().min(1)}),response:z.object({ok:z.boolean(),access_token:z.string(),refresh_token:z.string(),expires_in:z.number(),error:z.string()}),async handler(ctx,args){return ctx.executePrivileged(privileged.signInWithSupabase,{email:args.email,password:args.password})}}),
@@ -235,23 +255,56 @@ export const Actions = {
 
   generateDemandForecast: defineAction({
     request:z.object({auth_token:z.string().optional().default(""),actor_role:roleSchema,horizon_hours:z.union([z.literal(24),z.literal(168)]).default(168)}),
-    response:z.object({ok:z.boolean(),status:z.enum(["completed","insufficient_data","failed"]),forecast_count:z.number(),message:z.string(),run_id:z.string().optional()}),
-    privileged:[privileged.supabaseData,privileged.verifySupabaseUser,privileged.runDemandForecast],
+    response:z.object({ok:z.boolean(),status:z.enum(["completed","insufficient_data","failed","running","starting"]),forecast_count:z.number(),message:z.string(),run_id:z.string().optional(),job_id:z.string().optional()}),
+    privileged:[privileged.supabaseData,privileged.verifySupabaseUser,privileged.startDemandForecastJob],
     async handler(ctx,args){
       const access=await getAccess(ctx,args.auth_token);if(!["manager","owner"].includes(access.role))return{ok:false,status:"failed" as const,forecast_count:0,message:"Manager or owner access is required."};
       const db=supabaseDb(ctx,args.auth_token);const trainedAt=new Date();const runId=id("FCRUN");const fallbackVersion="hist-gradient-hourly-v1";
       const rows=await db.select({billId:schema.bills.id,outletId:schema.bills.outletId,timestamp:schema.bills.billTimestamp,total:schema.bills.total,itemQuantity:schema.billItems.quantity}).from(schema.billItems).innerJoin(schema.bills,eq(schema.billItems.billId,schema.bills.id)).where(eq(schema.bills.status,"completed"));
       const observations=aggregateHourlyDemand(rows.filter(row=>canAccessOutlet(access,row.outletId)));const days=new Map<string,Set<string>>();for(const row of observations){const set=days.get(row.outlet_id)??new Set<string>();set.add(row.timestamp.slice(0,10));days.set(row.outlet_id,set);}const eligible=[...days.values()].filter(set=>set.size>=21).length;
-      if(observations.length<168||eligible===0){const message="More historical transactions are required to establish a reliable demand pattern. At least 21 operating days and 168 hourly observations are required for an outlet.";await db.insert(schema.forecastRuns).values({id:runId,trainedAt,generatedAt:null,status:"insufficient_data",trainingRecords:observations.length,outletCount:eligible,horizonHours:args.horizon_hours,mae:null,rmse:null,mape:null,modelVersion:fallbackVersion,notes:message});ctx.invalidateQueries();return{ok:true,status:"insufficient_data" as const,forecast_count:0,message,run_id:runId};}
+      if(observations.length<168||eligible===0){const message="More historical transactions are required to establish a reliable demand pattern. At least 21 operating days and 168 hourly observations are required for an outlet.";await recordForecastRun(db,runId,trainedAt,"insufficient_data",observations.length,eligible,args.horizon_hours,fallbackVersion,message);ctx.invalidateQueries();return{ok:true,status:"insufficient_data" as const,forecast_count:0,message,run_id:runId};}
       try{
-        const result=await ctx.executePrivileged(privileged.runDemandForecast,{observations,horizon_hours:args.horizon_hours});
-        if(result.status==="insufficient_data"){await db.insert(schema.forecastRuns).values({id:runId,trainedAt,generatedAt:null,status:"insufficient_data",trainingRecords:result.training_records,outletCount:result.eligible_outlet_count,horizonHours:args.horizon_hours,mae:null,rmse:null,mape:null,modelVersion:result.model_version,notes:result.message});ctx.invalidateQueries();return{ok:true,status:"insufficient_data" as const,forecast_count:0,message:result.message,run_id:runId};}
-        const setting=(await db.select().from(schema.workforceSettings).where(eq(schema.workforceSettings.id,"WORKFORCE_GLOBAL")).limit(1))[0]??{ordersPerStaffHour:10,staffingBufferPercent:10,minimumStaff:1,maximumStaff:8};const createdAt=new Date();const forecasts:typeof schema.demandForecasts.$inferInsert[]=result.forecasts.map(row=>({id:id("FC"),outletId:row.outlet_id,forecastTimestamp:new Date(row.forecast_timestamp),predictedOrders:money(row.predicted_orders),lowerBound:null,upperBound:null,modelVersion:result.model_version,createdAt}));const plans:typeof schema.staffPlans.$inferInsert[]=forecasts.map(row=>{const staffing=staffingFor(row.predictedOrders,setting);return{id:id("STF"),outletId:row.outletId,forecastTimestamp:row.forecastTimestamp,forecastOrders:row.predictedOrders,baseStaff:staffing.base_staff,recommendedStaff:staffing.recommended_staff,modelVersion:row.modelVersion,createdAt}});// Bulk-persist the run: one operation carries every forecast row and the
-        // staff plans go in chunks of 80 rows per operation. The previous shape
-        // sent one database request per row (hundreds per run), which is what
-        // pushed Train & generate forecast past the host time limit.
-        const planTarget=[schema.staffPlans.outletId,schema.staffPlans.forecastTimestamp,schema.staffPlans.modelVersion];const writeStatements=[db.delete(schema.demandForecasts).where(eq(schema.demandForecasts.modelVersion,result.model_version)),db.insert(schema.forecastRuns).values({id:runId,trainedAt,generatedAt:createdAt,status:"completed",trainingRecords:result.training_records,outletCount:result.eligible_outlet_count,horizonHours:args.horizon_hours,mae:result.metrics?.mae??null,rmse:result.metrics?.rmse??null,mape:result.metrics?.mape??null,modelVersion:result.model_version,notes:result.message}),db.insert(schema.demandForecasts).values(forecasts)];const firstPlan=plans[0];if(firstPlan){for(let start=0;start<plans.length;start+=80)writeStatements.push(db.insert(schema.staffPlans).values(plans.slice(start,start+80)).onConflictDoUpdate({target:planTarget,set:{forecastOrders:firstPlan.forecastOrders,baseStaff:firstPlan.baseStaff,recommendedStaff:firstPlan.recommendedStaff,createdAt}}));}await db.batch(writeStatements);ctx.invalidateQueries();return{ok:true,status:"completed" as const,forecast_count:forecasts.length,message:result.message,run_id:runId};
-      }catch(error){const message=error instanceof Error?error.message:"The forecast service could not complete.";await db.insert(schema.forecastRuns).values({id:runId,trainedAt,generatedAt:null,status:"failed",trainingRecords:observations.length,outletCount:eligible,horizonHours:args.horizon_hours,mae:null,rmse:null,mape:null,modelVersion:fallbackVersion,notes:message});ctx.invalidateQueries();return{ok:false,status:"failed" as const,forecast_count:0,message:`${message} Existing forecasts are unchanged.`,run_id:runId};}
+        // Asynchronous generation: this call only starts the job on the ML
+        // service (or returns "starting" while the service wakes). The client
+        // polls pollDemandForecast until the job completes, so no single
+        // request waits on the full computation.
+        const job=await ctx.executePrivileged(privileged.startDemandForecastJob,{observations,horizon_hours:args.horizon_hours});
+        if(job.state==="starting")return{ok:true,status:"starting" as const,forecast_count:0,message:job.message||"The forecast service is starting up."};
+        if(job.state==="running")return{ok:true,status:"running" as const,forecast_count:0,message:job.message||"Forecast generation started.",job_id:job.job_id};
+        if(job.state==="failed"){await recordForecastRun(db,runId,trainedAt,"failed",observations.length,eligible,args.horizon_hours,fallbackVersion,job.message);ctx.invalidateQueries();return{ok:false,status:"failed" as const,forecast_count:0,message:`${job.message} Existing forecasts are unchanged.`,run_id:runId};}
+        const result=job.result;
+        if(!result){await recordForecastRun(db,runId,trainedAt,"failed",observations.length,eligible,args.horizon_hours,fallbackVersion,"The forecast service returned no result.");ctx.invalidateQueries();return{ok:false,status:"failed" as const,forecast_count:0,message:"The forecast service returned no result. Existing forecasts are unchanged.",run_id:runId};}
+        if(result.status==="insufficient_data"){await recordForecastRun(db,runId,trainedAt,"insufficient_data",result.training_records,result.eligible_outlet_count,args.horizon_hours,result.model_version,result.message);ctx.invalidateQueries();return{ok:true,status:"insufficient_data" as const,forecast_count:0,message:result.message,run_id:runId};}
+        const count=await persistForecastResult(db,result,args.horizon_hours,runId,trainedAt);ctx.invalidateQueries();return{ok:true,status:"completed" as const,forecast_count:count,message:result.message,run_id:runId};
+      }catch(error){const message=error instanceof Error?error.message:"The forecast service could not be started.";await recordForecastRun(db,runId,trainedAt,"failed",observations.length,eligible,args.horizon_hours,fallbackVersion,message);ctx.invalidateQueries();return{ok:false,status:"failed" as const,forecast_count:0,message:`${message} Existing forecasts are unchanged.`,run_id:runId};}
+    }
+  }),
+
+  pollDemandForecast: defineAction({
+    request:z.object({auth_token:z.string().optional().default(""),actor_role:roleSchema,job_id:z.string().min(1),horizon_hours:z.union([z.literal(24),z.literal(168)]).default(168)}),
+    response:z.object({ok:z.boolean(),status:z.enum(["completed","insufficient_data","failed","running","starting"]),forecast_count:z.number(),message:z.string(),run_id:z.string().optional(),job_id:z.string().optional()}),
+    privileged:[privileged.supabaseData,privileged.verifySupabaseUser,privileged.pollDemandForecastJob],
+    async handler(ctx,args){
+      const access=await getAccess(ctx,args.auth_token);if(!["manager","owner"].includes(access.role))return{ok:false,status:"failed" as const,forecast_count:0,message:"Manager or owner access is required.",job_id:args.job_id};
+      const db=supabaseDb(ctx,args.auth_token);
+      // A finished job persists under a deterministic run id, so a repeated
+      // poll (double click, retried request) reports the stored run instead
+      // of writing the forecasts twice.
+      const jobRunId=`FCJ_${args.job_id}`;
+      const existing=(await db.select().from(schema.forecastRuns).where(eq(schema.forecastRuns.id,jobRunId)).limit(1))[0];
+      if(existing){
+        if(existing.status==="completed"){const stored=await db.select({id:schema.demandForecasts.id}).from(schema.demandForecasts).where(eq(schema.demandForecasts.modelVersion,existing.modelVersion));return{ok:true,status:"completed" as const,forecast_count:stored.length,message:existing.notes??"Forecast generated.",run_id:existing.id,job_id:args.job_id};}
+        return{ok:existing.status!=="failed",status:existing.status as "insufficient_data"|"failed",forecast_count:0,message:existing.notes??"Forecast run recorded.",run_id:existing.id,job_id:args.job_id};
+      }
+      let job:{state:"running"|"completed"|"starting"|"failed";job_id:string;message:string;result:ForecastResultPayload|null};
+      try{job=await ctx.executePrivileged(privileged.pollDemandForecastJob,{job_id:args.job_id});}
+      catch(error){const message=error instanceof Error?error.message:"The forecast service could not be reached.";await recordForecastRun(db,jobRunId,new Date(),"failed",0,0,args.horizon_hours,"hist-gradient-hourly-v1",message);ctx.invalidateQueries();return{ok:false,status:"failed" as const,forecast_count:0,message:`${message} Existing forecasts are unchanged.`,run_id:jobRunId,job_id:args.job_id};}
+      if(job.state==="running"||job.state==="starting")return{ok:true,status:job.state,forecast_count:0,message:job.message||"Forecast is still generating.",job_id:args.job_id};
+      if(job.state==="failed"){await recordForecastRun(db,jobRunId,new Date(),"failed",0,0,args.horizon_hours,"hist-gradient-hourly-v1",job.message);ctx.invalidateQueries();return{ok:false,status:"failed" as const,forecast_count:0,message:`${job.message} Existing forecasts are unchanged.`,run_id:jobRunId,job_id:args.job_id};}
+      const result=job.result;
+      if(!result){await recordForecastRun(db,jobRunId,new Date(),"failed",0,0,args.horizon_hours,"hist-gradient-hourly-v1","The forecast service returned no result.");ctx.invalidateQueries();return{ok:false,status:"failed" as const,forecast_count:0,message:"The forecast service returned no result. Existing forecasts are unchanged.",run_id:jobRunId,job_id:args.job_id};}
+      if(result.status==="insufficient_data"){await recordForecastRun(db,jobRunId,new Date(),"insufficient_data",result.training_records,result.eligible_outlet_count,args.horizon_hours,result.model_version,result.message);ctx.invalidateQueries();return{ok:true,status:"insufficient_data" as const,forecast_count:0,message:result.message,run_id:jobRunId,job_id:args.job_id};}
+      const count=await persistForecastResult(db,result,args.horizon_hours,jobRunId,new Date());ctx.invalidateQueries();return{ok:true,status:"completed" as const,forecast_count:count,message:result.message,run_id:jobRunId,job_id:args.job_id};
     }
   }),
 

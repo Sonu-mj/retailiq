@@ -16135,6 +16135,45 @@ var privileged = definePrivilegedContracts({
     }),
     timeoutMs: 12e4
   },
+  startDemandForecastJob: {
+    request: external_exports.object({
+      observations: external_exports.array(external_exports.object({ outlet_id: external_exports.string(), timestamp: external_exports.string(), orders: external_exports.number(), units_sold: external_exports.number(), revenue: external_exports.number(), average_order_value: external_exports.number() })),
+      horizon_hours: external_exports.number().int().min(24).max(168)
+    }),
+    response: external_exports.object({
+      state: external_exports.enum(["running", "completed", "starting", "failed"]),
+      job_id: external_exports.string(),
+      message: external_exports.string(),
+      result: external_exports.object({
+        status: external_exports.enum(["completed", "insufficient_data"]),
+        model_version: external_exports.string(),
+        training_records: external_exports.number().int().nonnegative(),
+        eligible_outlet_count: external_exports.number().int().nonnegative(),
+        message: external_exports.string(),
+        metrics: external_exports.object({ mae: external_exports.number(), rmse: external_exports.number(), mape: external_exports.number().nullable() }).nullable(),
+        forecasts: external_exports.array(external_exports.object({ outlet_id: external_exports.string(), forecast_timestamp: external_exports.string(), predicted_orders: external_exports.number().nonnegative() }))
+      }).nullable()
+    }),
+    timeoutMs: 3e4
+  },
+  pollDemandForecastJob: {
+    request: external_exports.object({ job_id: external_exports.string().min(1) }),
+    response: external_exports.object({
+      state: external_exports.enum(["running", "completed", "starting", "failed"]),
+      job_id: external_exports.string(),
+      message: external_exports.string(),
+      result: external_exports.object({
+        status: external_exports.enum(["completed", "insufficient_data"]),
+        model_version: external_exports.string(),
+        training_records: external_exports.number().int().nonnegative(),
+        eligible_outlet_count: external_exports.number().int().nonnegative(),
+        message: external_exports.string(),
+        metrics: external_exports.object({ mae: external_exports.number(), rmse: external_exports.number(), mape: external_exports.number().nullable() }).nullable(),
+        forecasts: external_exports.array(external_exports.object({ outlet_id: external_exports.string(), forecast_timestamp: external_exports.string(), predicted_orders: external_exports.number().nonnegative() }))
+      }).nullable()
+    }),
+    timeoutMs: 3e4
+  },
   getSupabaseAuthConfig: {
     request: external_exports.object({}),
     response: external_exports.object({
@@ -18418,6 +18457,26 @@ function stockStatus(current, reorder, minimum) {
   if (current <= reorder) return "low_stock";
   return "healthy";
 }
+async function persistForecastResult(db, result, horizonHours, runId, trainedAt) {
+  const setting = (await db.select().from(workforceSettings).where(eq(workforceSettings.id, "WORKFORCE_GLOBAL")).limit(1))[0] ?? { ordersPerStaffHour: 10, staffingBufferPercent: 10, minimumStaff: 1, maximumStaff: 8 };
+  const createdAt = /* @__PURE__ */ new Date();
+  const forecasts = result.forecasts.map((row) => ({ id: id("FC"), outletId: row.outlet_id, forecastTimestamp: new Date(row.forecast_timestamp), predictedOrders: money2(row.predicted_orders), lowerBound: null, upperBound: null, modelVersion: result.model_version, createdAt }));
+  const plans = forecasts.map((row) => {
+    const staffing = staffingFor(row.predictedOrders, setting);
+    return { id: id("STF"), outletId: row.outletId, forecastTimestamp: row.forecastTimestamp, forecastOrders: row.predictedOrders, baseStaff: staffing.base_staff, recommendedStaff: staffing.recommended_staff, modelVersion: row.modelVersion, createdAt };
+  });
+  const planTarget = [staffPlans.outletId, staffPlans.forecastTimestamp, staffPlans.modelVersion];
+  const writeStatements = [db.delete(demandForecasts).where(eq(demandForecasts.modelVersion, result.model_version)), db.insert(forecastRuns).values({ id: runId, trainedAt, generatedAt: createdAt, status: "completed", trainingRecords: result.training_records, outletCount: result.eligible_outlet_count, horizonHours, mae: result.metrics?.mae ?? null, rmse: result.metrics?.rmse ?? null, mape: result.metrics?.mape ?? null, modelVersion: result.model_version, notes: result.message }), db.insert(demandForecasts).values(forecasts)];
+  const firstPlan = plans[0];
+  if (firstPlan) {
+    for (let start = 0; start < plans.length; start += 80) writeStatements.push(db.insert(staffPlans).values(plans.slice(start, start + 80)).onConflictDoUpdate({ target: planTarget, set: { forecastOrders: firstPlan.forecastOrders, baseStaff: firstPlan.baseStaff, recommendedStaff: firstPlan.recommendedStaff, createdAt } }));
+  }
+  await db.batch(writeStatements);
+  return forecasts.length;
+}
+async function recordForecastRun(db, runId, trainedAt, status, trainingRecords, outletCount, horizonHours, modelVersion, notes) {
+  await db.insert(forecastRuns).values({ id: runId, trainedAt, generatedAt: null, status, trainingRecords, outletCount, horizonHours, mae: null, rmse: null, mape: null, modelVersion, notes });
+}
 var Actions = {
   getAuthConfig: defineAction({ privileged: [privileged.supabaseData, privileged.getSupabaseAuthConfig], request: external_exports.object({}), response: external_exports.object({ configured: external_exports.boolean(), supabase_url: external_exports.string(), anon_key: external_exports.string(), redirect_url: external_exports.string() }), async handler(ctx) {
     return ctx.executePrivileged(privileged.getSupabaseAuthConfig, {});
@@ -19134,8 +19193,8 @@ var Actions = {
   }),
   generateDemandForecast: defineAction({
     request: external_exports.object({ auth_token: external_exports.string().optional().default(""), actor_role: roleSchema, horizon_hours: external_exports.union([external_exports.literal(24), external_exports.literal(168)]).default(168) }),
-    response: external_exports.object({ ok: external_exports.boolean(), status: external_exports.enum(["completed", "insufficient_data", "failed"]), forecast_count: external_exports.number(), message: external_exports.string(), run_id: external_exports.string().optional() }),
-    privileged: [privileged.supabaseData, privileged.verifySupabaseUser, privileged.runDemandForecast],
+    response: external_exports.object({ ok: external_exports.boolean(), status: external_exports.enum(["completed", "insufficient_data", "failed", "running", "starting"]), forecast_count: external_exports.number(), message: external_exports.string(), run_id: external_exports.string().optional(), job_id: external_exports.string().optional() }),
+    privileged: [privileged.supabaseData, privileged.verifySupabaseUser, privileged.startDemandForecastJob],
     async handler(ctx, args) {
       const access = await getAccess(ctx, args.auth_token);
       if (!["manager", "owner"].includes(access.role)) return { ok: false, status: "failed", forecast_count: 0, message: "Manager or owner access is required." };
@@ -19154,39 +19213,87 @@ var Actions = {
       const eligible = [...days.values()].filter((set2) => set2.size >= 21).length;
       if (observations.length < 168 || eligible === 0) {
         const message = "More historical transactions are required to establish a reliable demand pattern. At least 21 operating days and 168 hourly observations are required for an outlet.";
-        await db.insert(forecastRuns).values({ id: runId, trainedAt, generatedAt: null, status: "insufficient_data", trainingRecords: observations.length, outletCount: eligible, horizonHours: args.horizon_hours, mae: null, rmse: null, mape: null, modelVersion: fallbackVersion, notes: message });
+        await recordForecastRun(db, runId, trainedAt, "insufficient_data", observations.length, eligible, args.horizon_hours, fallbackVersion, message);
         ctx.invalidateQueries();
         return { ok: true, status: "insufficient_data", forecast_count: 0, message, run_id: runId };
       }
       try {
-        const result = await ctx.executePrivileged(privileged.runDemandForecast, { observations, horizon_hours: args.horizon_hours });
+        const job = await ctx.executePrivileged(privileged.startDemandForecastJob, { observations, horizon_hours: args.horizon_hours });
+        if (job.state === "starting") return { ok: true, status: "starting", forecast_count: 0, message: job.message || "The forecast service is starting up." };
+        if (job.state === "running") return { ok: true, status: "running", forecast_count: 0, message: job.message || "Forecast generation started.", job_id: job.job_id };
+        if (job.state === "failed") {
+          await recordForecastRun(db, runId, trainedAt, "failed", observations.length, eligible, args.horizon_hours, fallbackVersion, job.message);
+          ctx.invalidateQueries();
+          return { ok: false, status: "failed", forecast_count: 0, message: `${job.message} Existing forecasts are unchanged.`, run_id: runId };
+        }
+        const result = job.result;
+        if (!result) {
+          await recordForecastRun(db, runId, trainedAt, "failed", observations.length, eligible, args.horizon_hours, fallbackVersion, "The forecast service returned no result.");
+          ctx.invalidateQueries();
+          return { ok: false, status: "failed", forecast_count: 0, message: "The forecast service returned no result. Existing forecasts are unchanged.", run_id: runId };
+        }
         if (result.status === "insufficient_data") {
-          await db.insert(forecastRuns).values({ id: runId, trainedAt, generatedAt: null, status: "insufficient_data", trainingRecords: result.training_records, outletCount: result.eligible_outlet_count, horizonHours: args.horizon_hours, mae: null, rmse: null, mape: null, modelVersion: result.model_version, notes: result.message });
+          await recordForecastRun(db, runId, trainedAt, "insufficient_data", result.training_records, result.eligible_outlet_count, args.horizon_hours, result.model_version, result.message);
           ctx.invalidateQueries();
           return { ok: true, status: "insufficient_data", forecast_count: 0, message: result.message, run_id: runId };
         }
-        const setting = (await db.select().from(workforceSettings).where(eq(workforceSettings.id, "WORKFORCE_GLOBAL")).limit(1))[0] ?? { ordersPerStaffHour: 10, staffingBufferPercent: 10, minimumStaff: 1, maximumStaff: 8 };
-        const createdAt = /* @__PURE__ */ new Date();
-        const forecasts = result.forecasts.map((row) => ({ id: id("FC"), outletId: row.outlet_id, forecastTimestamp: new Date(row.forecast_timestamp), predictedOrders: money2(row.predicted_orders), lowerBound: null, upperBound: null, modelVersion: result.model_version, createdAt }));
-        const plans = forecasts.map((row) => {
-          const staffing = staffingFor(row.predictedOrders, setting);
-          return { id: id("STF"), outletId: row.outletId, forecastTimestamp: row.forecastTimestamp, forecastOrders: row.predictedOrders, baseStaff: staffing.base_staff, recommendedStaff: staffing.recommended_staff, modelVersion: row.modelVersion, createdAt };
-        });
-        const planTarget = [staffPlans.outletId, staffPlans.forecastTimestamp, staffPlans.modelVersion];
-        const writeStatements = [db.delete(demandForecasts).where(eq(demandForecasts.modelVersion, result.model_version)), db.insert(forecastRuns).values({ id: runId, trainedAt, generatedAt: createdAt, status: "completed", trainingRecords: result.training_records, outletCount: result.eligible_outlet_count, horizonHours: args.horizon_hours, mae: result.metrics?.mae ?? null, rmse: result.metrics?.rmse ?? null, mape: result.metrics?.mape ?? null, modelVersion: result.model_version, notes: result.message }), db.insert(demandForecasts).values(forecasts)];
-        const firstPlan = plans[0];
-        if (firstPlan) {
-          for (let start = 0; start < plans.length; start += 80) writeStatements.push(db.insert(staffPlans).values(plans.slice(start, start + 80)).onConflictDoUpdate({ target: planTarget, set: { forecastOrders: firstPlan.forecastOrders, baseStaff: firstPlan.baseStaff, recommendedStaff: firstPlan.recommendedStaff, createdAt } }));
-        }
-        await db.batch(writeStatements);
+        const count = await persistForecastResult(db, result, args.horizon_hours, runId, trainedAt);
         ctx.invalidateQueries();
-        return { ok: true, status: "completed", forecast_count: forecasts.length, message: result.message, run_id: runId };
+        return { ok: true, status: "completed", forecast_count: count, message: result.message, run_id: runId };
       } catch (error51) {
-        const message = error51 instanceof Error ? error51.message : "The forecast service could not complete.";
-        await db.insert(forecastRuns).values({ id: runId, trainedAt, generatedAt: null, status: "failed", trainingRecords: observations.length, outletCount: eligible, horizonHours: args.horizon_hours, mae: null, rmse: null, mape: null, modelVersion: fallbackVersion, notes: message });
+        const message = error51 instanceof Error ? error51.message : "The forecast service could not be started.";
+        await recordForecastRun(db, runId, trainedAt, "failed", observations.length, eligible, args.horizon_hours, fallbackVersion, message);
         ctx.invalidateQueries();
         return { ok: false, status: "failed", forecast_count: 0, message: `${message} Existing forecasts are unchanged.`, run_id: runId };
       }
+    }
+  }),
+  pollDemandForecast: defineAction({
+    request: external_exports.object({ auth_token: external_exports.string().optional().default(""), actor_role: roleSchema, job_id: external_exports.string().min(1), horizon_hours: external_exports.union([external_exports.literal(24), external_exports.literal(168)]).default(168) }),
+    response: external_exports.object({ ok: external_exports.boolean(), status: external_exports.enum(["completed", "insufficient_data", "failed", "running", "starting"]), forecast_count: external_exports.number(), message: external_exports.string(), run_id: external_exports.string().optional(), job_id: external_exports.string().optional() }),
+    privileged: [privileged.supabaseData, privileged.verifySupabaseUser, privileged.pollDemandForecastJob],
+    async handler(ctx, args) {
+      const access = await getAccess(ctx, args.auth_token);
+      if (!["manager", "owner"].includes(access.role)) return { ok: false, status: "failed", forecast_count: 0, message: "Manager or owner access is required.", job_id: args.job_id };
+      const db = supabaseDb(ctx, args.auth_token);
+      const jobRunId = `FCJ_${args.job_id}`;
+      const existing = (await db.select().from(forecastRuns).where(eq(forecastRuns.id, jobRunId)).limit(1))[0];
+      if (existing) {
+        if (existing.status === "completed") {
+          const stored = await db.select({ id: demandForecasts.id }).from(demandForecasts).where(eq(demandForecasts.modelVersion, existing.modelVersion));
+          return { ok: true, status: "completed", forecast_count: stored.length, message: existing.notes ?? "Forecast generated.", run_id: existing.id, job_id: args.job_id };
+        }
+        return { ok: existing.status !== "failed", status: existing.status, forecast_count: 0, message: existing.notes ?? "Forecast run recorded.", run_id: existing.id, job_id: args.job_id };
+      }
+      let job;
+      try {
+        job = await ctx.executePrivileged(privileged.pollDemandForecastJob, { job_id: args.job_id });
+      } catch (error51) {
+        const message = error51 instanceof Error ? error51.message : "The forecast service could not be reached.";
+        await recordForecastRun(db, jobRunId, /* @__PURE__ */ new Date(), "failed", 0, 0, args.horizon_hours, "hist-gradient-hourly-v1", message);
+        ctx.invalidateQueries();
+        return { ok: false, status: "failed", forecast_count: 0, message: `${message} Existing forecasts are unchanged.`, run_id: jobRunId, job_id: args.job_id };
+      }
+      if (job.state === "running" || job.state === "starting") return { ok: true, status: job.state, forecast_count: 0, message: job.message || "Forecast is still generating.", job_id: args.job_id };
+      if (job.state === "failed") {
+        await recordForecastRun(db, jobRunId, /* @__PURE__ */ new Date(), "failed", 0, 0, args.horizon_hours, "hist-gradient-hourly-v1", job.message);
+        ctx.invalidateQueries();
+        return { ok: false, status: "failed", forecast_count: 0, message: `${job.message} Existing forecasts are unchanged.`, run_id: jobRunId, job_id: args.job_id };
+      }
+      const result = job.result;
+      if (!result) {
+        await recordForecastRun(db, jobRunId, /* @__PURE__ */ new Date(), "failed", 0, 0, args.horizon_hours, "hist-gradient-hourly-v1", "The forecast service returned no result.");
+        ctx.invalidateQueries();
+        return { ok: false, status: "failed", forecast_count: 0, message: "The forecast service returned no result. Existing forecasts are unchanged.", run_id: jobRunId, job_id: args.job_id };
+      }
+      if (result.status === "insufficient_data") {
+        await recordForecastRun(db, jobRunId, /* @__PURE__ */ new Date(), "insufficient_data", result.training_records, result.eligible_outlet_count, args.horizon_hours, result.model_version, result.message);
+        ctx.invalidateQueries();
+        return { ok: true, status: "insufficient_data", forecast_count: 0, message: result.message, run_id: jobRunId, job_id: args.job_id };
+      }
+      const count = await persistForecastResult(db, result, args.horizon_hours, jobRunId, /* @__PURE__ */ new Date());
+      ctx.invalidateQueries();
+      return { ok: true, status: "completed", forecast_count: count, message: result.message, run_id: jobRunId, job_id: args.job_id };
     }
   }),
   saveWorkforceSettings: defineAction({ privileged: [privileged.supabaseData, privileged.verifySupabaseUser], request: external_exports.object({ auth_token: external_exports.string().optional().default(""), orders_per_staff_hour: external_exports.number().positive().max(1e3), staffing_buffer_percent: external_exports.number().min(0).max(100), minimum_staff: external_exports.number().int().min(0).max(100), maximum_staff: external_exports.number().int().min(1).max(200), actor_role: roleSchema }), response: external_exports.object({ ok: external_exports.boolean(), error: external_exports.string().optional() }), async handler(ctx, args) {
@@ -19736,6 +19843,45 @@ var privileged2 = definePrivilegedContracts({
     }),
     timeoutMs: 12e4
   },
+  startDemandForecastJob: {
+    request: external_exports.object({
+      observations: external_exports.array(external_exports.object({ outlet_id: external_exports.string(), timestamp: external_exports.string(), orders: external_exports.number(), units_sold: external_exports.number(), revenue: external_exports.number(), average_order_value: external_exports.number() })),
+      horizon_hours: external_exports.number().int().min(24).max(168)
+    }),
+    response: external_exports.object({
+      state: external_exports.enum(["running", "completed", "starting", "failed"]),
+      job_id: external_exports.string(),
+      message: external_exports.string(),
+      result: external_exports.object({
+        status: external_exports.enum(["completed", "insufficient_data"]),
+        model_version: external_exports.string(),
+        training_records: external_exports.number().int().nonnegative(),
+        eligible_outlet_count: external_exports.number().int().nonnegative(),
+        message: external_exports.string(),
+        metrics: external_exports.object({ mae: external_exports.number(), rmse: external_exports.number(), mape: external_exports.number().nullable() }).nullable(),
+        forecasts: external_exports.array(external_exports.object({ outlet_id: external_exports.string(), forecast_timestamp: external_exports.string(), predicted_orders: external_exports.number().nonnegative() }))
+      }).nullable()
+    }),
+    timeoutMs: 3e4
+  },
+  pollDemandForecastJob: {
+    request: external_exports.object({ job_id: external_exports.string().min(1) }),
+    response: external_exports.object({
+      state: external_exports.enum(["running", "completed", "starting", "failed"]),
+      job_id: external_exports.string(),
+      message: external_exports.string(),
+      result: external_exports.object({
+        status: external_exports.enum(["completed", "insufficient_data"]),
+        model_version: external_exports.string(),
+        training_records: external_exports.number().int().nonnegative(),
+        eligible_outlet_count: external_exports.number().int().nonnegative(),
+        message: external_exports.string(),
+        metrics: external_exports.object({ mae: external_exports.number(), rmse: external_exports.number(), mape: external_exports.number().nullable() }).nullable(),
+        forecasts: external_exports.array(external_exports.object({ outlet_id: external_exports.string(), forecast_timestamp: external_exports.string(), predicted_orders: external_exports.number().nonnegative() }))
+      }).nullable()
+    }),
+    timeoutMs: 3e4
+  },
   getSupabaseAuthConfig: {
     request: external_exports.object({}),
     response: external_exports.object({
@@ -19850,6 +19996,7 @@ var privileged2 = definePrivilegedContracts({
     timeoutMs: 12e4
   }
 });
+var forecastResultSchema = privileged2.runDemandForecast.response;
 async function runRemote(args, baseUrl) {
   const response = await fetch(`${baseUrl.replace(/\/$/, "")}/ml/analyze`, {
     method: "POST",
@@ -19874,6 +20021,43 @@ async function runDemandRemote(args, baseUrl) {
   }
   if (!response.ok) throw new Error(`The forecast service returned HTTP ${response.status}; no forecast was generated.`);
   return privileged2.runDemandForecast.response.parse(await response.json());
+}
+var FORECAST_JOB_REQUEST_TIMEOUT_MS = 12e3;
+function mlHeaders() {
+  return { "content-type": "application/json", ...process.env.RETAILIQ_ML_SERVICE_TOKEN ? { authorization: `Bearer ${process.env.RETAILIQ_ML_SERVICE_TOKEN}` } : {} };
+}
+async function startDemandJobRemote(args, baseUrl) {
+  let response;
+  try {
+    response = await fetch(`${baseUrl.replace(/\/$/, "")}/forecast/jobs`, { method: "POST", headers: mlHeaders(), body: JSON.stringify(args), signal: AbortSignal.timeout(FORECAST_JOB_REQUEST_TIMEOUT_MS) });
+  } catch {
+    return { state: "starting", job_id: "", message: "The forecast service is starting up.", result: null };
+  }
+  if (response.status === 404 || response.status >= 500) return { state: "starting", job_id: "", message: "The forecast service is starting up.", result: null };
+  if (!response.ok) return { state: "failed", job_id: "", message: `The forecast service returned HTTP ${response.status}; no forecast was generated.`, result: null };
+  const payload = await response.json().catch(() => null);
+  if (typeof payload?.job_id !== "string" || !payload.job_id) return { state: "failed", job_id: "", message: "The forecast service did not return a job id; no forecast was generated.", result: null };
+  return { state: "running", job_id: payload.job_id, message: "Forecast generation started.", result: null };
+}
+async function pollDemandJobRemote(jobId, baseUrl) {
+  let response;
+  try {
+    response = await fetch(`${baseUrl.replace(/\/$/, "")}/forecast/jobs/${encodeURIComponent(jobId)}`, { method: "GET", headers: mlHeaders(), signal: AbortSignal.timeout(FORECAST_JOB_REQUEST_TIMEOUT_MS) });
+  } catch {
+    return { state: "running", job_id: jobId, message: "Forecast is still generating.", result: null };
+  }
+  if (response.status === 404) return { state: "failed", job_id: jobId, message: "The forecast job is no longer available on the service (it may have restarted). Start the forecast again; no forecast was generated.", result: null };
+  if (response.status >= 500) return { state: "running", job_id: jobId, message: "Forecast is still generating.", result: null };
+  if (!response.ok) return { state: "failed", job_id: jobId, message: `The forecast service returned HTTP ${response.status}; no forecast was generated.`, result: null };
+  const payload = await response.json().catch(() => null);
+  if (payload?.status === "running") return { state: "running", job_id: jobId, message: "Forecast is still generating.", result: null };
+  if (payload?.status === "failed") return { state: "failed", job_id: jobId, message: typeof payload.error === "string" && payload.error ? payload.error : "The forecast service could not complete the job.", result: null };
+  if (payload?.status === "completed") {
+    const parsed = forecastResultSchema.safeParse(payload.result);
+    if (!parsed.success) return { state: "failed", job_id: jobId, message: "The forecast service returned an unreadable result; no forecast was generated.", result: null };
+    return { state: "completed", job_id: jobId, message: parsed.data.message, result: parsed.data };
+  }
+  return { state: "failed", job_id: jobId, message: "The forecast service returned an unexpected job status; no forecast was generated.", result: null };
 }
 async function runDemandLocal(_args) {
   throw new Error("Demand forecasting cannot run in this deployment because RETAILIQ_ML_SERVICE_URL is not set.");
@@ -19992,6 +20176,16 @@ var privilegedHandlers = definePrivilegedHandlers(privileged2, {
   async runDemandForecast(args) {
     const remote = process.env.RETAILIQ_ML_SERVICE_URL?.trim();
     return remote ? runDemandRemote(args, remote) : runDemandLocal(args);
+  },
+  async startDemandForecastJob(args) {
+    const remote = process.env.RETAILIQ_ML_SERVICE_URL?.trim();
+    if (!remote) return { state: "failed", job_id: "", message: "Demand forecasting cannot run in this deployment because RETAILIQ_ML_SERVICE_URL is not set.", result: null };
+    return startDemandJobRemote(args, remote);
+  },
+  async pollDemandForecastJob(args) {
+    const remote = process.env.RETAILIQ_ML_SERVICE_URL?.trim();
+    if (!remote) return { state: "failed", job_id: args.job_id, message: "Demand forecasting cannot run in this deployment because RETAILIQ_ML_SERVICE_URL is not set.", result: null };
+    return pollDemandJobRemote(args.job_id, remote);
   },
   async getSupabaseAuthConfig() {
     const redirectUrl = process.env.RETAILIQ_AUTH_REDIRECT_URL?.trim() ?? "";

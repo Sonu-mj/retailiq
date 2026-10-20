@@ -4,46 +4,64 @@
 
 The latest fixes are committed in this git pack:
 
-- Folder: `your_files/retailiq-git/` (git repo, branch `main`, commit `28e72f0`)
-- Previous commits: `cc64f43` (Settings source & git panel), `8ea1921` (reports/dashboard fixes)
+- Folder: `your_files/retailiq-git/` (git repo, branch `main`, commit `bcf234d`)
+- Production repo clone: `~/workspace/retailiq-push/` at commit `4e954bd`
+  (same fix, on top of production `7e1a24f`)
+- Previous commits: `28e72f0` (profit trend/insights, NumPy ML runners),
+  `cc64f43` (Settings source & git panel), `8ea1921` (reports/dashboard fixes)
 
 This workspace itself is not a git repo and GitHub CLI is not signed in here,
 so the push runs from your PC, where you are logged in to GitHub as Sonu-mj.
 No password or token is stored in this app or in the repo.
 
-## Fixed files in commit 28e72f0
+## Fixed in this sync - forecast timeout on Vercel
 
-- `server/src/actions.ts` - insights re-insert no longer kills getCommandCenter
-  (each insert is wrapped so a rejection cannot fail the read, and it now
-  conflicts on `dedupe_key`); forecast rows carry the real staff `plan_id`;
-  Staff Planner reads/writes real staff plan IDs; forecast day-count fix
-- `server/src/supabaseDb.ts` - **repo-variant file, MODIFIED**: the
-  `onConflictDoNothing({target})` fix was ported into this repo (sql.js)
-  variant, so it passes `on_conflict=dedupe_key` to PostgREST exactly like the
-  space variant. If the four deployment files are restored from the repo
-  clone before pushing, use the pack's `supabaseDb.ts` (or the equally fixed
-  copy in `~/workspace/retailiq-push/`), not an older clone copy without the fix.
-- `server/src/privileged.ts` - repo-variant (sql.js) file, restored verbatim,
-  unmodified; its insert handler already turns `operation.conflict` into
-  `?on_conflict=...` with `resolution=ignore-duplicates`
-- `client/src/api.ts`, `client/src/supabaseAuth.ts` - repo variants restored
-  (type-only Actions import, endpoint `/api/actions`), unmodified
-- `client/src/Profitability.tsx` - "How profit is changing" now shows
-  loading / error-with-retry states and dots on short series instead of a
-  blank-looking panel
-- `client/src/Demand.tsx` - Staff Planner saves scheduled staff against the
-  real plan ID and disables rows that have no plan
-- `ml-service/analyzer.py`, `ml-service/forecast_model.py` - NumPy-only
-  Isolation Forest and histogram gradient boosting runners (no scikit-learn);
-  `ml-service/requirements.txt` drops scikit-learn
-- `api/actions.js` - rebuilt bundle from the sources above
+"Train & generate forecast" died with a 504 (60s Vercel Hobby limit) and no
+forecast was ever produced, while the page kept showing the stale note
+"Set RETAILIQ_ML_SERVICE_URL to run demand forecasting on Vercel" from an
+older failed run - even though the URL is set and the Render service is live.
+Root causes, all inside the one serverless function:
 
-Verified before commit: repo build (`npm run vercel-build` = vite build +
-esbuild bundle) passes with these exact files, typecheck passes, the bundle
-contains the `on_conflict` / `dedupe_key` / `ignore-duplicates` chain, and both
-ML fixture tests pass (`forecast fixture pipeline: ok`; anomaly demo `PASS`).
+- One run persisted hundreds of forecast and staff-plan rows as individual
+  database requests (2 outlets x 168 hours x 2 tables), and the prior-run
+  delete did the same per row.
+- The ML-service call allowed itself 115 seconds inside a 60-second function,
+  so a slow service start ended as a platform kill with nothing recorded.
 
-Commit message: `Fix profit trend/insights, NumPy ML runners, forecast and Staff Planner IDs`
+What changed:
+
+- `server/src/actions.ts` - shared file, copied verbatim. Forecast runs now
+  bulk-persist: one operation carries all forecast rows, staff plans upsert
+  in chunks of 80 rows, everything lands in one small batch.
+  `generateWeeklyStaffPlan` uses the same chunked bulk upsert. A failed run
+  now returns (and records) the actual failure message. Settings
+  `getSystemHealth` derives ML/Forecast status and detail from the latest
+  run row (status, completion time, signal/training counts) - the same state
+  the Anomalies and Demand Intelligence pages show - instead of parroting
+  stored run notes.
+- `server/src/privileged.ts` - **repo-variant file, edited in place** (kept
+  the repo variant: no local Python runners, sql.js data bridge): deletes
+  use one `in.(...)` request per 200 keys instead of one DELETE per row; the
+  remote forecast call to `RETAILIQ_ML_SERVICE_URL` `/forecast/generate`
+  gets a 45-second budget that fits the function limit, with distinct honest
+  messages for timeout ("did not respond within 45 seconds - it may still be
+  starting up"), unreachable service, and HTTP errors; the not-configured
+  fallback now states the URL is not set in this deployment. The anomaly
+  path is untouched. The Muse artifact copy of this file carries the same
+  changes with its local-runner fallback and a 115-second remote budget.
+- `server/src/supabaseDb.ts` - repo variant, **unchanged this round** (it
+  still carries last sync's ported `onConflictDoNothing({target})` fix).
+- `client/src/api.ts`, `client/src/supabaseAuth.ts` - repo variants, unchanged.
+- `api/actions.js` - rebuilt bundle from the sources above.
+
+Verified before commit: repo typecheck passes; repo build (`npm run
+vercel-build`) passes; the bundle contains the bulk-write path, the
+`in.(...)` delete, `FORECAST_REMOTE_TIMEOUT_MS = 45e3` on the forecast call
+(the anomaly call keeps its own timeout), and the new error wording; both ML
+fixture tests pass (`forecast fixture pipeline: ok`; anomaly demo `PASS`).
+Pack consistency: `server/src/actions.ts` matches the artifact source;
+`server/src/privileged.ts`, `server/src/supabaseDb.ts`, and `api/actions.js`
+match the production repo clone.
 
 ## Push steps (on your PC)
 

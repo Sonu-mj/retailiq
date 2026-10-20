@@ -18076,7 +18076,7 @@ function tableDef(table) {
     columns: Object.entries(columns).map(([property, column]) => ({
       property,
       name: column.name,
-      kind: column.columnType === "SQLiteBoolean" ? "boolean" : column.columnType === "SQLiteTimestamp" ? "date" : column.dataType === "number" ? "number" : "string"
+      kind: column.columnType === "SQLiteBoolean" ? "boolean" : column.columnType === "SQLiteTimestamp" || column.mode === "timestamp_ms" ? "date" : column.dataType === "number" ? "number" : "string"
     }))
   };
 }
@@ -18563,7 +18563,12 @@ var Actions = {
     const productName = new Map(products2.map((row) => [row.id, row.name]));
     const categoryName = new Map(categories2.map((row) => [row.id, row.name]));
     const productCategory = new Map(products2.map((row) => [row.id, row.categoryId]));
-    const inRange = (date5) => date5 >= start && date5 <= end;
+    const startMs = start.getTime();
+    const endMs = end.getTime();
+    const inRange = (value) => {
+      const time3 = value instanceof Date ? value.getTime() : typeof value === "number" ? value : typeof value === "string" ? Date.parse(value) : NaN;
+      return Number.isFinite(time3) && time3 >= startMs && time3 <= endMs;
+    };
     const matchOutlet = (value) => !args.outlet_id || value === args.outlet_id;
     const matchProduct = (value) => !args.product_id || value === args.product_id;
     const matchCategory = (value) => !args.category_id || productCategory.get(value) === args.category_id;
@@ -18681,7 +18686,10 @@ var Actions = {
     }
     const latestIntel = (await db.select().from(intelligenceRuns).orderBy(desc(intelligenceRuns.startedAt)).limit(1))[0];
     const latestForecast = (await db.select().from(forecastRuns).orderBy(desc(forecastRuns.trainedAt)).limit(1))[0];
-    const services = [{ name: "Database", status: database, detail: database === "operational" ? "Read probe succeeded" : "Read probe failed" }, { name: "Authentication", status: "operational", detail: "Supabase access token and active profile verified" }, { name: "Analytics service", status: "operational", detail: "Profitability engine is available" }, { name: "ML service", status: latestIntel?.status === "failed" ? "degraded" : latestIntel ? "operational" : "unconfigured", detail: latestIntel?.notes ?? "No intelligence run has been attempted" }, { name: "Forecast service", status: latestForecast?.status === "failed" ? "degraded" : latestForecast ? "operational" : "unconfigured", detail: latestForecast?.notes ?? "No forecast run has been attempted" }];
+    const staleRun = (date5) => !date5 || Date.now() - date5.getTime() > 24 * 36e5;
+    const mlStale = latestIntel?.status === "completed" && staleRun(latestIntel.completedAt ?? latestIntel.startedAt);
+    const forecastStale = latestForecast?.status === "completed" && staleRun(latestForecast.generatedAt ?? latestForecast.trainedAt);
+    const services = [{ name: "Database", status: database, detail: database === "operational" ? "Read probe succeeded" : "Read probe failed" }, { name: "Authentication", status: "operational", detail: "Supabase access token and active profile verified" }, { name: "Analytics service", status: "operational", detail: "Profitability engine is available" }, { name: "ML service", status: latestIntel?.status === "completed" && !mlStale ? "operational" : latestIntel ? "degraded" : "unconfigured", detail: latestIntel?.status === "completed" && mlStale ? "The last completed scan is over 24 hours old, so current signals may be stale" : latestIntel ? latestIntel.status === "insufficient_data" ? "Waiting for enough sales history before signals can be produced" : latestIntel.notes ?? "The latest intelligence run did not complete" : "No intelligence run has been attempted" }, { name: "Forecast service", status: latestForecast?.status === "completed" && !forecastStale ? "operational" : latestForecast ? "degraded" : "unconfigured", detail: latestForecast?.status === "completed" && forecastStale ? "The last completed forecast is over 24 hours old, so predictions may be stale" : latestForecast ? latestForecast.status === "insufficient_data" ? "Waiting for enough sales history before forecasts can be produced" : latestForecast.notes ?? "The latest forecast run did not complete" : "No forecast run has been attempted" }];
     return { checked_at: (/* @__PURE__ */ new Date()).toISOString(), services };
   } }),
   initializeCatalog: defineAction({ privileged: [privileged.supabaseData, privileged.verifySupabaseUser], request: external_exports.object({ auth_token: external_exports.string().optional().default("") }), response: external_exports.object({ ok: external_exports.literal(true) }), async handler(ctx, args) {
@@ -18988,7 +18996,10 @@ var Actions = {
     const end = new Date(args.end);
     if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) throw new Error("Invalid date range");
     const outletRows = (await db.select().from(outlets).where(eq(outlets.isActive, true)).orderBy(asc(outlets.name))).filter((o) => canAccessOutlet(access, o.id) && (!args.outlet_id || o.id === args.outlet_id));
-    const [saleRows, returnRows, wasteRows, costRows] = await Promise.all([db.select({ bill: bills, item: billItems }).from(billItems).innerJoin(bills, eq(billItems.billId, bills.id)).where(and(eq(bills.status, "completed"), gte(bills.billTimestamp, start), lte(bills.billTimestamp, end))), db.select({ row: returnRecords, item: billItems }).from(returnRecords).innerJoin(billItems, eq(returnRecords.billItemId, billItems.id)).where(and(gte(returnRecords.returnTimestamp, start), lte(returnRecords.returnTimestamp, end))), db.select({ row: wastage, productName: products.name }).from(wastage).innerJoin(products, eq(wastage.productId, products.id)).where(and(gte(wastage.wastageTimestamp, start), lte(wastage.wastageTimestamp, end))), db.select().from(outletCosts)]);
+    const [allSaleRows, allReturnRows, allWasteRows, costRows] = await Promise.all([db.select({ bill: bills, item: billItems }).from(billItems).innerJoin(bills, eq(billItems.billId, bills.id)).where(eq(bills.status, "completed")), db.select({ row: returnRecords, item: billItems }).from(returnRecords).innerJoin(billItems, eq(returnRecords.billItemId, billItems.id)), db.select({ row: wastage, productName: products.name }).from(wastage).innerJoin(products, eq(wastage.productId, products.id)), db.select().from(outletCosts)]);
+    const saleRows = allSaleRows.filter(({ bill }) => bill.billTimestamp >= start && bill.billTimestamp <= end);
+    const returnRows = allReturnRows.filter(({ row }) => row.returnTimestamp >= start && row.returnTimestamp <= end);
+    const wasteRows = allWasteRows.filter(({ row }) => row.wastageTimestamp >= start && row.wastageTimestamp <= end);
     const allowed = new Set(outletRows.map((row) => row.id));
     const sales = saleRows.filter(({ bill }) => allowed.has(bill.outletId)).map(({ bill, item }) => ({ outletId: bill.outletId, productId: item.productId, productName: item.productNameSnapshot, categoryName: item.categoryNameSnapshot, quantity: item.quantity, sellingPrice: item.sellingPrice, costPrice: item.costPrice, revenue: item.lineTotal }));
     const returns = returnRows.filter(({ row }) => allowed.has(row.outletId)).map(({ row, item }) => ({ outletId: row.outletId, productId: row.productId, quantity: row.quantity, amount: row.returnAmount, unitCost: item.costPrice }));
@@ -19275,20 +19286,30 @@ var Actions = {
       const todayStart = new Date(now);
       todayStart.setHours(0, 0, 0, 0);
       const todayEnd = new Date(todayStart.getTime() + 864e5 - 1);
-      const [outletRows, saleRows, periodBills, returnRows, wasteRows, costRows, anomalyRows, intelRuns, forecastRuns2, forecastRows, planRows, todayBills] = await Promise.all([
+      const [outletRows, allSaleRows, allPeriodBills, allReturnRows, allWasteRows, costRows, allAnomalyRows, intelRuns, forecastRuns2, allForecastRows, allPlanRows, allTodayBills] = await Promise.all([
         db.select().from(outlets).where(eq(outlets.isActive, true)).orderBy(asc(outlets.name)),
-        db.select({ bill: bills, item: billItems }).from(billItems).innerJoin(bills, eq(billItems.billId, bills.id)).where(and(eq(bills.status, "completed"), gte(bills.billTimestamp, start), lte(bills.billTimestamp, end))),
-        db.select().from(bills).where(and(eq(bills.status, "completed"), gte(bills.billTimestamp, start), lte(bills.billTimestamp, end))),
-        db.select({ row: returnRecords, item: billItems }).from(returnRecords).innerJoin(billItems, eq(returnRecords.billItemId, billItems.id)).where(and(gte(returnRecords.returnTimestamp, start), lte(returnRecords.returnTimestamp, end))),
-        db.select({ row: wastage, productName: products.name }).from(wastage).innerJoin(products, eq(wastage.productId, products.id)).where(and(gte(wastage.wastageTimestamp, start), lte(wastage.wastageTimestamp, end))),
+        db.select({ bill: bills, item: billItems }).from(billItems).innerJoin(bills, eq(billItems.billId, bills.id)).where(eq(bills.status, "completed")),
+        db.select().from(bills).where(eq(bills.status, "completed")),
+        db.select({ row: returnRecords, item: billItems }).from(returnRecords).innerJoin(billItems, eq(returnRecords.billItemId, billItems.id)),
+        db.select({ row: wastage, productName: products.name }).from(wastage).innerJoin(products, eq(wastage.productId, products.id)),
         db.select().from(outletCosts),
-        db.select({ event: anomalyEvents, outletName: outlets.name }).from(anomalyEvents).innerJoin(outlets, eq(anomalyEvents.outletId, outlets.id)).where(and(gte(anomalyEvents.eventTimestamp, start), lte(anomalyEvents.eventTimestamp, end))).orderBy(desc(anomalyEvents.eventTimestamp)).limit(100),
+        db.select({ event: anomalyEvents, outletName: outlets.name }).from(anomalyEvents).innerJoin(outlets, eq(anomalyEvents.outletId, outlets.id)).orderBy(desc(anomalyEvents.eventTimestamp)),
         db.select().from(intelligenceRuns).orderBy(desc(intelligenceRuns.startedAt)).limit(1),
         db.select().from(forecastRuns).orderBy(desc(forecastRuns.trainedAt)).limit(1),
-        db.select().from(demandForecasts).where(and(gte(demandForecasts.forecastTimestamp, now), lte(demandForecasts.forecastTimestamp, tomorrow))).orderBy(asc(demandForecasts.forecastTimestamp)).limit(500),
-        db.select().from(staffPlans).where(and(gte(staffPlans.forecastTimestamp, now), lte(staffPlans.forecastTimestamp, tomorrow))).orderBy(asc(staffPlans.forecastTimestamp)).limit(500),
-        db.select().from(bills).where(and(eq(bills.status, "completed"), gte(bills.billTimestamp, todayStart), lte(bills.billTimestamp, todayEnd)))
+        db.select().from(demandForecasts).orderBy(asc(demandForecasts.forecastTimestamp)),
+        db.select().from(staffPlans).orderBy(asc(staffPlans.forecastTimestamp)),
+        db.select().from(bills).where(eq(bills.status, "completed"))
       ]);
+      const inPeriod = (value) => value >= start && value <= end;
+      const inNext24h = (value) => value >= now && value <= tomorrow;
+      const saleRows = allSaleRows.filter(({ bill }) => inPeriod(bill.billTimestamp));
+      const periodBills = allPeriodBills.filter((bill) => inPeriod(bill.billTimestamp));
+      const returnRows = allReturnRows.filter(({ row }) => inPeriod(row.returnTimestamp));
+      const wasteRows = allWasteRows.filter(({ row }) => inPeriod(row.wastageTimestamp));
+      const anomalyRows = allAnomalyRows.filter(({ event }) => inPeriod(event.eventTimestamp)).slice(0, 100);
+      const forecastRows = allForecastRows.filter((row) => inNext24h(row.forecastTimestamp)).slice(0, 500);
+      const planRows = allPlanRows.filter((row) => inNext24h(row.forecastTimestamp)).slice(0, 500);
+      const todayBills = allTodayBills.filter((bill) => bill.billTimestamp >= todayStart && bill.billTimestamp <= todayEnd);
       const scopedOutlets = outletRows.filter((row) => canAccessOutlet(access, row.id) && (!args.outlet_id || row.id === args.outlet_id));
       const scopedIds = new Set(scopedOutlets.map((row) => row.id));
       const sales = saleRows.filter(({ bill }) => scopedIds.has(bill.outletId)).map(({ bill, item }) => ({ outletId: bill.outletId, productId: item.productId, productName: item.productNameSnapshot, categoryName: item.categoryNameSnapshot, quantity: item.quantity, sellingPrice: item.sellingPrice, costPrice: item.costPrice, revenue: item.lineTotal }));
@@ -19332,7 +19353,7 @@ var Actions = {
         addInsight(event.outletId, "anomaly", event.severity, `${outletName}: ${event.summary}`, `An unresolved ${event.severity.replaceAll("_", " ")} model signal requires review.`, "anomaly", event.id);
       }
       for (const candidate of candidates) await db.insert(businessInsights).values(candidate).onConflictDoNothing();
-      const insightRows = await db.select({ row: businessInsights, outletName: outlets.name }).from(businessInsights).leftJoin(outlets, eq(businessInsights.outletId, outlets.id)).where(and(gte(businessInsights.generatedAt, start), lte(businessInsights.generatedAt, end))).orderBy(desc(businessInsights.generatedAt)).limit(100);
+      const insightRows = (await db.select({ row: businessInsights, outletName: outlets.name }).from(businessInsights).leftJoin(outlets, eq(businessInsights.outletId, outlets.id)).orderBy(desc(businessInsights.generatedAt)).limit(100)).filter(({ row }) => row.generatedAt >= start && row.generatedAt <= end);
       const outletData = profitRows.map((row) => {
         const f = activeForecasts.filter((item) => item.outletId === row.outlet_id);
         const peak2 = [...f].sort((a, b) => b.predictedOrders - a.predictedOrders)[0];
@@ -19361,7 +19382,7 @@ var Actions = {
       }
       const peak = [...activeForecasts].sort((a, b) => b.predictedOrders - a.predictedOrders)[0];
       const targetFor = (type) => type === "anomaly" ? "intelligence" : type === "staffing_gap" ? "demand" : type === "high_returns" ? "history" : type === "high_wastage" ? "wastage" : type === "operating_cost_pressure" ? "costs" : "profit";
-      return { generated_at: now.toISOString(), demo_mode: false, period: { start: start.toISOString(), end: end.toISOString() }, kpis: { total_revenue: total.gross_sales, net_sales: total.net_sales, gross_profit: total.gross_profit, net_profit: total.net_profit, profit_margin: total.net_sales > 0 ? total.net_margin : null, orders: [...ordersByOutlet.values()].reduce((sum, value) => sum + value, 0), active_ml_signals: unresolved.length, forecasted_orders: money2(activeForecasts.reduce((sum, row) => sum + row.predictedOrders, 0)) }, operational_status: operationalStatus, status_explanation: statusExplanation, outlets_monitored: scopedOutlets.length, today_summary: { revenue: money2(todayBills.filter((row) => scopedIds.has(row.outletId)).reduce((sum, row) => sum + row.total, 0)), orders: todayBills.filter((row) => scopedIds.has(row.outletId)).length, signals: unresolved.length, peak_label: peak?.forecastTimestamp.toISOString() ?? null, peak_orders: peak?.predictedOrders ?? null }, freshness: { last_updated: now.toISOString(), last_anomaly_scan: intelRuns[0]?.completedAt?.toISOString() ?? null, forecast_generated: lastForecast?.generatedAt?.toISOString() ?? null }, outlets: outletData, insights: insightRows.filter(({ row }) => !args.outlet_id || row.outletId === args.outlet_id).map(({ row, outletName }) => ({ id: row.id, outlet_id: row.outletId, outlet_name: outletName ?? null, generated_at: row.generatedAt.toISOString(), insight_type: row.insightType, severity: row.severity, title: row.title, description: row.description, related_entity_type: row.relatedEntityType, related_entity_id: row.relatedEntityId, status: row.status, target: targetFor(row.insightType) })), anomalies: unresolved.slice(0, 8).map(({ event, outletName }) => ({ id: event.id, outlet_id: event.outletId, outlet_name: outletName, severity: event.severity, summary: event.summary, event_timestamp: event.eventTimestamp.toISOString(), investigation_status: event.investigationStatus })), next_24h: [...nextMap.entries()].map(([timestamp, orders]) => ({ timestamp, orders: money2(orders) })), staffing: activeForecasts.slice(0, 12).map((row) => {
+      return { generated_at: now.toISOString(), demo_mode: false, period: { start: start.toISOString(), end: end.toISOString() }, kpis: { total_revenue: total.gross_sales, net_sales: total.net_sales, gross_profit: total.gross_profit, net_profit: total.net_profit, profit_margin: total.net_sales > 0 ? total.net_margin : null, orders: [...ordersByOutlet.values()].reduce((sum, value) => sum + value, 0), active_ml_signals: unresolved.length, forecasted_orders: money2(activeForecasts.reduce((sum, row) => sum + row.predictedOrders, 0)) }, operational_status: operationalStatus, status_explanation: statusExplanation, outlets_monitored: scopedOutlets.length, today_summary: { revenue: money2(todayBills.filter((row) => scopedIds.has(row.outletId)).reduce((sum, row) => sum + row.subtotal, 0)), orders: todayBills.filter((row) => scopedIds.has(row.outletId)).length, signals: unresolved.length, peak_label: peak?.forecastTimestamp.toISOString() ?? null, peak_orders: peak?.predictedOrders ?? null }, freshness: { last_updated: now.toISOString(), last_anomaly_scan: intelRuns[0]?.completedAt?.toISOString() ?? null, forecast_generated: lastForecast?.generatedAt?.toISOString() ?? null }, outlets: outletData, insights: insightRows.filter(({ row }) => !args.outlet_id || row.outletId === args.outlet_id).map(({ row, outletName }) => ({ id: row.id, outlet_id: row.outletId, outlet_name: outletName ?? null, generated_at: row.generatedAt.toISOString(), insight_type: row.insightType, severity: row.severity, title: row.title, description: row.description, related_entity_type: row.relatedEntityType, related_entity_id: row.relatedEntityId, status: row.status, target: targetFor(row.insightType) })), anomalies: unresolved.slice(0, 8).map(({ event, outletName }) => ({ id: event.id, outlet_id: event.outletId, outlet_name: outletName, severity: event.severity, summary: event.summary, event_timestamp: event.eventTimestamp.toISOString(), investigation_status: event.investigationStatus })), next_24h: [...nextMap.entries()].map(([timestamp, orders]) => ({ timestamp, orders: money2(orders) })), staffing: activeForecasts.slice(0, 12).map((row) => {
         const plan = planMap.get(`${row.outletId}|${row.forecastTimestamp.toISOString()}`);
         return { id: plan?.id ?? row.id, outlet_id: row.outletId, outlet_name: scopedOutlets.find((outlet) => outlet.id === row.outletId)?.name ?? row.outletId, timestamp: row.forecastTimestamp.toISOString(), expected_orders: row.predictedOrders, recommended_staff: plan?.recommendedStaff ?? 0 };
       }), trend: [...trendMap.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([date5, value]) => ({ date: date5, revenue: money2(value.revenue), contribution: money2(value.contribution) })), source_status: { profitability: "available", anomalies: intelRuns[0]?.status === "failed" ? "unavailable" : intelRuns[0]?.status === "completed" ? "available" : "waiting", forecast: lastForecast?.status === "failed" ? "unavailable" : lastForecast?.status === "completed" ? "available" : "waiting" } };
@@ -19383,10 +19404,17 @@ var Actions = {
     const access = await getAccess(ctx, args.auth_token);
     requireRole(access, ["manager", "owner"]);
     const db = supabaseDb(ctx, args.auth_token);
-    const allRows = await db.select().from(businessInsights).where(eq(businessInsights.status, "new")).orderBy(desc(businessInsights.generatedAt)).limit(40);
-    const rows = allRows.filter((row) => !row.outletId || canAccessOutlet(access, row.outletId));
+    const allRows = await db.select().from(businessInsights).where(eq(businessInsights.status, "new")).orderBy(desc(businessInsights.generatedAt)).limit(500);
+    const accessible = allRows.filter((row) => !row.outletId || canAccessOutlet(access, row.outletId));
+    const seen = /* @__PURE__ */ new Set();
+    const rows = accessible.filter((row) => {
+      const key = `${row.insightType}|${row.outletId ?? ""}|${row.title}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     const item = (row) => ({ id: row.id, title: row.title, source: row.insightType.replaceAll("_", " ") });
-    return { unread: rows.length, groups: { high_attention: rows.filter((row) => row.severity === "high_attention").map(item), elevated: rows.filter((row) => row.severity === "elevated").map(item), watch: rows.filter((row) => row.severity === "watch" || row.severity === "informational").map(item) } };
+    return { unread: rows.length, groups: { high_attention: rows.filter((row) => row.severity === "high_attention").slice(0, 8).map(item), elevated: rows.filter((row) => row.severity === "elevated").slice(0, 8).map(item), watch: rows.filter((row) => row.severity === "watch" || row.severity === "informational").slice(0, 8).map(item) } };
   } }),
   globalSearch: defineAction({ privileged: [privileged.supabaseData, privileged.verifySupabaseUser], request: external_exports.object({ auth_token: external_exports.string().optional().default(""), query: external_exports.string().trim().min(2).max(100) }), response: external_exports.object({ results: external_exports.array(external_exports.object({ id: external_exports.string(), type: external_exports.enum(["Outlet", "Bill", "Product", "Customer", "Anomaly", "Insight"]), title: external_exports.string(), subtitle: external_exports.string(), target: external_exports.enum(["command", "billing", "history", "profit", "intelligence", "demand"]) })) }), async handler(ctx, args) {
     const access = await getAccess(ctx, args.auth_token);
@@ -19436,7 +19464,9 @@ var Actions = {
       const demand = orders > 0 ? money2(expectedOrders * (units / orders)) : 0;
       const raw = Math.max(0, demand + stock.safetyStock - stock.currentQuantity);
       const suggested = raw > 0 ? Math.min(stock.maximumQuantity > 0 ? Math.max(0, stock.maximumQuantity - stock.currentQuantity) : Number.MAX_SAFE_INTEGER, Math.max(stock.minimumOrderQuantity, Math.ceil(raw))) : 0;
-      const status = stockStatus(stock.currentQuantity, stock.reorderPoint, stock.minimumQuantity);
+      const effectiveReorder = stock.reorderPoint > 0 ? stock.reorderPoint : 15;
+      const effectiveMinimum = stock.minimumQuantity > 0 ? stock.minimumQuantity : Math.min(5, effectiveReorder);
+      const status = stockStatus(stock.currentQuantity, effectiveReorder, effectiveMinimum);
       return { id: stock.id, outlet_id: stock.outletId, outlet_name: outletName, product_id: stock.productId, product_name: productName, sku, category_name: categoryName, current_quantity: stock.currentQuantity, minimum_quantity: stock.minimumQuantity, maximum_quantity: stock.maximumQuantity, reorder_point: stock.reorderPoint, reorder_quantity: stock.reorderQuantity, lead_time_days: stock.leadTimeDays, safety_stock: stock.safetyStock, minimum_order_quantity: stock.minimumOrderQuantity, status, last_movement_at: lastMovement.get(key)?.toISOString() ?? null, stock_value: money2(stock.currentQuantity * cost), forecast_demand: demand, suggested_reorder_quantity: suggested, projected_pressure: stock.currentQuantity < demand + stock.safetyStock, units_sold_30d: units };
     });
     const movements = movementRows.filter(({ movement }) => canAccessOutlet(access, movement.outletId) && (!args.outlet_id || movement.outletId === args.outlet_id) && (!args.product_id || movement.productId === args.product_id)).map(({ movement, outletName, productName, createdByName }) => ({ id: movement.id, outlet_id: movement.outletId, outlet_name: outletName, product_id: movement.productId, product_name: productName, movement_type: movement.movementType, quantity: movement.quantity, reference_type: movement.referenceType, reference_id: movement.referenceId, unit_cost: movement.unitCost, notes: movement.notes, created_by: createdByName, created_at: movement.createdAt.toISOString() }));

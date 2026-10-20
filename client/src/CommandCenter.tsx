@@ -13,7 +13,7 @@ type View="command"|"billing"|"history"|"inventory"|"wastage"|"costs"|"profit"|"
 type Preset="today"|"7d"|"month"|"previous"|"custom";
 const pad=(n:number)=>String(n).padStart(2,"0");
 const inputDate=(d:Date)=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-const bounds=(start:string,end:string)=>({start:new Date(`${start}T00:00:00`).toISOString(),end:new Date(`${end}T23:59:59.999`).toISOString()});
+const bounds=(start:string,end:string)=>({start:`${start}T00:00:00.000Z`,end:`${end}T23:59:59.999Z`});
 const statusClass=(value:string)=>value.toLowerCase().replaceAll(" ","-");
 const compactTime=(iso:string)=>new Intl.DateTimeFormat("en-IN",{weekday:"short",hour:"numeric",hour12:true}).format(new Date(iso));
 const fmtPct=(value:number|null)=>value==null?"N/A":`${value.toFixed(1)}%`;

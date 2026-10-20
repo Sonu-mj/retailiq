@@ -1,8 +1,62 @@
 import { Buffer } from "node:buffer";
-import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join } from "node:path";
+import type { Database as SqlJsDatabase, SqlJsStatic } from "sql.js";
 import { definePrivilegedContracts, definePrivilegedHandlers, z } from "@hatch/space-sdk";
+
+const require = createRequire(import.meta.url);
+let sqlJsRuntime: Promise<SqlJsStatic> | null = null;
+
+// Load sql.js only when a local SQLite adapter is actually needed. Keeping the
+// package load and initialization out of module scope prevents an unavailable
+// optional runtime from taking down every Vercel action during import.
+function getSqlJsRuntime(): Promise<SqlJsStatic> {
+  if (sqlJsRuntime) return sqlJsRuntime;
+  try {
+    const initSqlJs = require("sql.js/dist/sql-asm.js") as () => Promise<SqlJsStatic>;
+    sqlJsRuntime = Promise.resolve(initSqlJs()).catch(error => {
+      sqlJsRuntime = null;
+      throw new Error("The local SQLite runtime is unavailable on this server.", { cause: error });
+    });
+    return sqlJsRuntime;
+  } catch (error) {
+    sqlJsRuntime = null;
+    return Promise.reject(new Error("The local SQLite runtime is unavailable on this server.", { cause: error }));
+  }
+}
+
+// Small adapter preserving the query API used by the original Bun-hosted
+// implementation while running in a standard Vercel Node.js function. The
+// asm.js build avoids native binaries and WebAssembly asset lookup at runtime.
+class Database {
+  constructor(private readonly db: SqlJsDatabase) {}
+  query(sql: string) {
+    return {
+      all: (...params: Array<string | number | boolean | null>) => {
+        const statement = this.db.prepare(sql);
+        try {
+          statement.bind(params.map(value => typeof value === "boolean" ? (value ? 1 : 0) : value));
+          const rows: Array<Record<string, unknown>> = [];
+          while (statement.step()) rows.push(statement.getAsObject());
+          return rows;
+        } finally { statement.free(); }
+      },
+      get: (...params: Array<string | number | boolean | null>) => {
+        const statement = this.db.prepare(sql);
+        try {
+          statement.bind(params.map(value => typeof value === "boolean" ? (value ? 1 : 0) : value));
+          return statement.step() ? statement.getAsObject() : undefined;
+        } finally { statement.free(); }
+      },
+    };
+  }
+  prepare(sql: string) {
+    return { run: (...params: Array<string | number | boolean | null>) => this.db.run(sql, params.map(value => typeof value === "boolean" ? (value ? 1 : 0) : value)) };
+  }
+  run(sql: string) { this.db.run(sql); }
+  close() { this.db.close(); }
+}
 
 // Public Supabase client configuration has production-safe defaults so the Muse
 // preview works without deployment settings. Vercel environment variables take
@@ -180,16 +234,8 @@ async function runRemote(args: AnalysisRequest, baseUrl: string): Promise<Analys
   return privileged.runIsolationForest.response.parse(await response.json());
 }
 
-async function runLocal(args: AnalysisRequest): Promise<AnalysisResponse> {
-  const candidates = [join(process.cwd(), "ml-service", "runner.py"), join(process.cwd(), "..", "ml-service", "runner.py")];
-  const script = candidates.find(existsSync);
-  if (!script) throw new Error("RetailIQ ML runner is unavailable on this host.");
-  const child = Bun.spawn(["python3", script], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-  child.stdin.write(JSON.stringify(args));
-  child.stdin.end();
-  const [code, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-  if (code !== 0) throw new Error(error.trim() || "RetailIQ ML runner failed.");
-  return privileged.runIsolationForest.response.parse(JSON.parse(output));
+async function runLocal(_args: AnalysisRequest): Promise<AnalysisResponse> {
+  throw new Error("Set RETAILIQ_ML_SERVICE_URL to run anomaly analysis on Vercel.");
 }
 
 async function runDemandRemote(args: ForecastRequest, baseUrl: string): Promise<ForecastResponse> {
@@ -198,15 +244,8 @@ async function runDemandRemote(args: ForecastRequest, baseUrl: string): Promise<
   return privileged.runDemandForecast.response.parse(await response.json());
 }
 
-async function runDemandLocal(args: ForecastRequest): Promise<ForecastResponse> {
-  const candidates=[join(process.cwd(),"ml-service","forecast_runner.py"),join(process.cwd(),"..","ml-service","forecast_runner.py")];
-  const script=candidates.find(existsSync);
-  if(!script)throw new Error("RetailIQ demand forecast runner is unavailable on this host.");
-  const child=Bun.spawn(["python3",script],{stdin:"pipe",stdout:"pipe",stderr:"pipe"});
-  child.stdin.write(JSON.stringify(args));child.stdin.end();
-  const [code,output,error]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
-  if(code!==0)throw new Error(error.trim()||"RetailIQ demand forecast runner failed.");
-  return privileged.runDemandForecast.response.parse(JSON.parse(output));
+async function runDemandLocal(_args: ForecastRequest): Promise<ForecastResponse> {
+  throw new Error("Set RETAILIQ_ML_SERVICE_URL to run demand forecasting on Vercel.");
 }
 
 type SupabaseTokenPayload={access_token?:unknown;refresh_token?:unknown;expires_in?:unknown;error_description?:unknown;msg?:unknown;message?:unknown};
@@ -445,7 +484,7 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const blank=(table:string):MigrationTableReport=>({table,rows_read:0,inserted:0,skipped_existing:0,conflicts_kept_newer:0,updated_from_managed:0,excluded:0,error:null});
     const emptyResult=(error:string)=>({status:"failed" as const,started_at:startedAt.toISOString(),completed_at:new Date().toISOString(),source:"Managed store snapshot",rows_read:0,inserted:0,skipped_existing:0,conflicts_kept_newer:0,updated_from_managed:0,excluded:0,tables:MANAGED_TABLES.map(spec=>({...blank(spec.name),error})),error});
     if(!config.url||!config.anonKey)return emptyResult("Supabase is not configured on the application server.");
-    const dbPath=[join(process.cwd(),"app.db"),join(process.cwd(),"..","app.db"),join(import.meta.dir,"..","..","app.db"),join(import.meta.dir,"..","app.db")].find(existsSync);
+    const dbPath=[join(process.cwd(),"app.db"),join(process.cwd(),"..","app.db")].find(existsSync);
     if(!dbPath)return emptyResult("The managed-store snapshot is not available on this application server.");
     const headers={apikey:config.anonKey,authorization:`Bearer ${args.access_token}`};
     const readRemote=async(table:string)=>{
@@ -459,7 +498,8 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       }
       return rows;
     };
-    const managed=new Database(dbPath,{readonly:true});
+    const SQL=await getSqlJsRuntime();
+    const managed=new Database(new SQL.Database(readFileSync(dbPath)));
     const reports:MigrationTableReport[]=[];
     try{
       const available=new Set((managed.query("select name from sqlite_master where type='table'").all() as Array<{name:string}>).map(row=>row.name));
@@ -550,16 +590,12 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       return rows;
     };
     const makeDb=async(defs:Array<{name:string;columns:Array<{name:string;kind:"number"|"boolean"|"date"|"string"}>}>)=>{
-      const db=new Database(":memory:");
+      const SQL=await getSqlJsRuntime();
+      const db=new Database(new SQL.Database());
       for(const def of defs){
-        const name=assertName(def.name);const cols=def.columns.map(column=>`"${assertName(column.name)}" ${column.kind==="number"||column.kind==="boolean"||column.kind==="date"?"REAL":"TEXT"}`).join(",");
+        const name=assertName(def.name);const cols=def.columns.map(column=>`"${assertName(column.name)}" ${column.kind==="number"||column.kind==="boolean"?"REAL":"TEXT"}`).join(",");
         db.run(`create table "${name}" (${cols})`);
-        // Date columns are stored as epoch milliseconds so they compare
-        // numerically against the epoch-ms parameters Drizzle renders for
-        // timestamp columns. Storing the ISO text PostgREST returns instead
-        // makes every ">=" date bound pass and every "<=" bound fail, which
-        // silently empties all date-range queries.
-        const rows=await fetchRows(name);if(rows.length){const names=def.columns.map(column=>column.name);const kinds=new Map(def.columns.map(column=>[column.name,column.kind]));const statement=db.prepare(`insert into "${name}" (${names.map(column=>`"${column}"`).join(",")}) values (${names.map(()=>"?").join(",")})`);for(const row of rows)statement.run(...names.map(column=>{const value=row[column];if(typeof value==="boolean")return value?1:0;if(kinds.get(column)==="date"&&value!=null){const ms=typeof value==="number"?value:Date.parse(String(value));return Number.isFinite(ms)?ms:null;}return value??null}) as Array<string|number|boolean|null>);}
+        const rows=await fetchRows(name);if(rows.length){const names=def.columns.map(column=>column.name);const statement=db.prepare(`insert into "${name}" (${names.map(column=>`"${column}"`).join(",")}) values (${names.map(()=>"?").join(",")})`);for(const row of rows)statement.run(...names.map(column=>{const value=row[column];return typeof value==="boolean"?(value?1:0):value??null}) as Array<string|number|boolean|null>);}
       }
       return db;
     };

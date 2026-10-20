@@ -6,13 +6,46 @@ The latest fixes are committed in this git pack:
 
 - Folder: `your_files/retailiq-git/` (git repo, branch `main`)
 - Production repo clone: `~/workspace/retailiq-push/` (same fix, on top of
-  production `c91e035`)
+  production `98bc338`)
 
 This workspace itself is not a git repo and GitHub CLI is not signed in here,
 so the push runs from your PC, where you are logged in to GitHub as Sonu-mj.
 No password or token is stored in this app or in the repo.
 
-## Fixed in this sync - forecast generation is now asynchronous
+## Fixed in this sync - demo login shown on the sign-in screen
+
+For visitors arriving from the resume / LinkedIn link, the sign-in screen
+now shows a clear demo box above the normal form:
+
+- Labelled "Demo / viewing account", with the note that it is for people
+  who arrived from the resume or LinkedIn and just want to look around.
+- Shows exactly: Email: demo@gmail.com and Password: password123.
+- A "View the demo" button fills both sign-in fields in one tap; the
+  visitor then presses the normal Sign In button. The regular sign-in
+  form is unchanged for real users.
+
+What changed:
+
+- `client/src/Phase7.tsx` - shared file, copied verbatim. `AccessGate`
+  gains the demo box (login mode only) and a `fillDemo` handler that sets
+  the email and password state to the demo credentials.
+- `client/src/theme.css` - shared file, copied verbatim. Styles for
+  `.demo-box` and its rows/button, appended to the Phase 7 auth block.
+- Repo-variant files untouched this round: `server/src/privileged.ts`,
+  `server/src/supabaseDb.ts`, `client/src/api.ts`,
+  `client/src/supabaseAuth.ts`. No server change, so `api/actions.js`
+  is unchanged; Vercel rebuilds the client from source on push.
+
+Verified before commit: the Muse artifact build passes; the audit captures
+(desktop and mobile) show the demo box with the exact credentials and the
+unchanged form below it; a probe click on "View the demo" filled Email
+with demo@gmail.com and the password field (masked); repo typecheck
+(`npm run typecheck`) passes in the production clone. The demo account
+itself (demo@gmail.com, Manager for Bangalore Outlet 01) is set up
+separately in Supabase - the parent pushes only after that sign-in is
+verified live.
+
+## Fixed in the previous sync - forecast generation is now asynchronous
 
 Live proof from the previous build (production c91e035, three Train attempts
 20 Oct, 10:30-10:33 pm IST): every attempt ended with "The forecast service
